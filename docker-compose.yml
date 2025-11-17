@@ -1,0 +1,39 @@
+services:
+  asr-gw:
+    env_file:
+      - ./.env
+    image: node:20-alpine
+    working_dir: /app
+    command: ["sh","-c","cp /app/gw-package.json /app/package.json && npm install --omit=dev && node server/asr-gw.js"]
+    environment:
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
+      - WIDGET_PORT=${WIDGET_PORT}
+      - RTP_PORT=${RTP_PORT}
+    volumes:
+      - ./server:/app/server
+      - ./public:/app/public
+      - ./gw-package.json:/app/gw-package.json:ro
+    ports:
+      - "18080:8080"        # widget (HTTP)
+      - "40000:40000/udp"  # RTP/UDP publicado
+    restart: unless-stopped
+
+  ari-app:
+    env_file:
+      - ./.env
+    image: node:20-alpine
+    working_dir: /app
+    command: ["sh","-c","cp /app/ari-package.json /app/package.json && npm install --omit=dev && node server/ari-app.js"]
+    environment:
+      - ARI_URL=${ARI_URL}
+      - ARI_USER=${ARI_USER}
+      - ARI_PASS=${ARI_PASS}
+      - APP_NAME=${APP_NAME}
+      - RTP_HOST=${RTP_HOST}
+    volumes:
+      - ./server:/app/server
+      - ./ari-package.json:/app/ari-package.json:ro
+    depends_on:
+      - asr-gw
+    restart: unless-stopped
+

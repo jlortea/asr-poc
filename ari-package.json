@@ -1,0 +1,9 @@
+{
+  "name": "ari-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "dependencies": {
+    "ari-client": "^2.2.0"
+  }
+}
