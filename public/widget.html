@@ -5,45 +5,62 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
     body { font: 14px system-ui, sans-serif; margin: 8px; }
-    #live { white-space: pre-wrap; line-height: 1.4; }
-    .final { opacity: .95; }
-    .partial { opacity: .65; }
+    #live { white-space: pre-wrap; line-height: 1.4; max-height: 95vh; overflow-y: auto; }
+    .final { opacity: .95; margin: 2px 0; }
+    .partial { opacity: .65; margin: 2px 0; }
   </style>
 </head>
 <body>
   <div id="live"></div>
+
   <script src="/socket.io/socket.io.js"></script>
   <script>
     const params = new URLSearchParams(location.search);
-    const uuid = params.get('uuid');
-    const socket = io({ query: { uuid }});
+
+    // ✅ room por extensión (fallback a 'mix')
+    const exten = params.get('exten') || 'mix';
+
+    // ✅ por retrocompat del server, usamos query.uuid como room
+    const socket = io({ query: { uuid: exten } });
+
     const live = document.getElementById('live');
 
+    function addLine(text, cls) {
+      const p = document.createElement('div');
+      p.className = cls;
+      p.textContent = text;
+      live.appendChild(p);
+      live.scrollTop = live.scrollHeight;
+      return p;
+    }
+
     let lastPartial = null;
-    socket.on('stt', ({text, isFinal}) => {
+    let lastPartialSpeaker = null;
+
+    socket.on('stt', ({ text, isFinal, speaker }) => {
       if (!text) return;
+      const prefix = speaker ? `[${speaker}] ` : '';
+
       if (isFinal) {
         if (lastPartial) { lastPartial.remove(); lastPartial = null; }
-        const p = document.createElement('div');
-        p.className = 'final';
-        p.textContent = text;
-        live.appendChild(p);
+        addLine(prefix + text, 'final');
+        lastPartialSpeaker = null;
       } else {
-        if (!lastPartial) {
-          lastPartial = document.createElement('div');
-          lastPartial.className = 'partial';
-          live.appendChild(lastPartial);
+        if (!lastPartial || lastPartialSpeaker !== speaker) {
+          if (lastPartial) lastPartial.remove();
+          lastPartial = addLine(prefix + text, 'partial');
+          lastPartialSpeaker = speaker;
+        } else {
+          lastPartial.textContent = prefix + text;
         }
-        lastPartial.textContent = text;
       }
-      live.scrollTop = live.scrollHeight;
     });
+
     socket.on('stt-end', () => {
-      const p = document.createElement('div');
-      p.className = 'final';
-      p.textContent = '[fin de transcripción]';
-      live.appendChild(p);
+      addLine('[fin de transcripción]', 'final');
     });
+
+    console.log('[Widget] conectado a room/exten:', exten);
   </script>
 </body>
 </html>
