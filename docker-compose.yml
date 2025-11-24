@@ -29,7 +29,9 @@ services:
     restart: unless-stopped
 
   ##########################################
-  # GATEWAY MTI (mti-gw)
+  # GATEWAY MTI (mti-gw)  — RTP dinámico por llamada
+  # Opción 2: puertos UDP dinámicos + /register
+  # Recomendado: network_mode: host para escuchar el rango completo sin publicarlo.
   ##########################################
   mti-gw:
     env_file:
@@ -37,15 +39,24 @@ services:
     image: node:20-alpine
     working_dir: /app
     command: ["sh","-c","cp /app/gw-package.json /app/package.json && npm install --omit=dev && node server/mti-gw.js"]
+
+    # MUY IMPORTANTE:
+    # Con host network el contenedor escucha directamente en el host los UDP dinámicos,
+    # por eso NO hay ports: para UDP.
+    network_mode: host
+
     environment:
       - MTI_HOST=${MTI_HOST}
       - MTI_PORT=${MTI_PORT}
-      - MTI_RTP_PORT=${MTI_RTP_PORT}
+
+      # rango de puertos dinámicos (solo informativo aquí, el que lo usa es tap-service)
+      - MTI_RTP_START=${MTI_RTP_START}
+      - MTI_RTP_END=${MTI_RTP_END}
+
     volumes:
       - ./server:/app/server
       - ./gw-package.json:/app/gw-package.json:ro
-    ports:
-      - "40010:40010/udp"   # RTP/UDP publicado (gateway MTI)
+
     restart: unless-stopped
 
   ##########################################
@@ -65,6 +76,11 @@ services:
       - TAP_HTTP_PORT=${TAP_HTTP_PORT}
       - RTP_HOST_MTI=${RTP_HOST_MTI}
       - RTP_HOST_DEEPGRAM=${RTP_HOST_DEEPGRAM}
+      # opcional, solo por claridad
+      - MTI_RTP_START=${MTI_RTP_START}
+      - MTI_RTP_END=${MTI_RTP_END}
+      - MTI_GW_HTTP_HOST=${MTI_GW_HTTP_HOST}
+      - MTI_GW_HTTP_PORT=${MTI_GW_HTTP_PORT}
     volumes:
       - ./server:/app/server
       - ./tap-package.json:/app/tap-package.json:ro

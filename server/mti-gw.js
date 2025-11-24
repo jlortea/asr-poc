@@ -1,36 +1,29 @@
-// mti-gw.js
-// Gateway MTI/Whisper:
-//  - Recibe RTP/SLIN16 (16kHz, 16bit LE, mono) desde Asterisk ExternalMedia.
-//  - Agrupa paquetes por SSRC (1 SSRC = 1 llamada/1 sesión).
-//  - Por cada sesión abre 1 socket TCP hacia el servidor MTI.
-//  - Envía frames binarios con formato:
-//      [ TYPE (1 byte) ][ LENGTH (2 bytes, big-endian) ][ PAYLOAD (n bytes) ]
-//    Secuencia:
-//      - TYPE=0x01, LENGTH=len(UUID), PAYLOAD=UUID (UTF-8)   → inicio
-//      - TYPE=0x12, LENGTH=640, PAYLOAD=640 bytes PCM       → audio (20ms)
-//      - TYPE=0x00, LENGTH=0, sin PAYLOAD                   → fin
-//    Después de TYPE=0x00 cierra el socket TCP.
+// mti-gw.js (OPCIÓN 2 DEFINITIVA)
+//  - Recibe RTP SLIN16 en PUERTOS DINÁMICOS por llamada.
+//  - Cada llamada se registra vía HTTP /register (uuid, port).
+//  - 1 puerto UDP = 1 sesión = 1 socket TCP hacia MTI.
+//  - START frame incluye el UNIQUEID real.
 
 const dgram = require('dgram');
 const net   = require('net');
+const http  = require('http');
+const url   = require('url');
 
-// === Configuración desde entorno ===
-// Para mantener compatibilidad con tu docker-compose actual,
-// usamos las mismas variables "WHISPER_*" pero representan el servidor MTI.
-const MTI_HOST      = process.env.MTI_HOST     || '127.0.0.1';
-const MTI_PORT      = Number(process.env.MTI_PORT     || 9092);
-const MTI_RTP_PORT  = Number(process.env.MTI_RTP_PORT || 40010);
+const MTI_HOST = process.env.MTI_HOST || '127.0.0.1';
+const MTI_PORT = Number(process.env.MTI_PORT || 9092);
+
+// HTTP control
+const MTI_GW_HTTP_PORT = Number(process.env.MTI_GW_HTTP_PORT || 9093);
 
 if (!MTI_HOST || !MTI_PORT) {
-  console.error('[MTI-GW] ❌ Falta MTI_HOST/MTI_PORT (host/puerto servidor MTI)');
+  console.error('[MTI-GW] ❌ Missing MTI_HOST/MTI_PORT');
   process.exit(1);
 }
 
-// === Constantes del protocolo y timing ===
-const AUDIO_FRAME_SIZE = 640;    // 20ms @16kHz 16-bit mono
-const INACTIVITY_MS    = 8000;   // Si no llega RTP en 8s → fin sesión
+const AUDIO_FRAME_SIZE = 640;
+const INACTIVITY_MS    = 8000;
 
-// === RTP utils ===
+// RTP payload extractor
 function rtpPayload(buf) {
   if (buf.length < 12) return null;
   const cc = buf[0] & 0x0f;
@@ -45,56 +38,31 @@ function rtpPayload(buf) {
   return buf.subarray(offset);
 }
 
-// Construye un frame AudioSocket: [TYPE][LEN_BE][PAYLOAD]
 function buildFrame(type, payloadBuf) {
   const len = payloadBuf ? payloadBuf.length : 0;
   const buf = Buffer.alloc(1 + 2 + len);
   buf[0] = type;
   buf.writeUInt16BE(len, 1);
-  if (payloadBuf && len > 0) {
-    payloadBuf.copy(buf, 3);
-  }
+  if (payloadBuf && len > 0) payloadBuf.copy(buf, 3);
   return buf;
 }
 
-// Genera un UUID "decente" para la sesión a partir del SSRC.
-// Importante: de cara al cliente, podemos cambiar esto para que sea
-// exactamente el UUID de llamada que queramos. Ahora mismo es un
-// placeholder estable por sesión.
-function mkUuidForSsrc(ssrc) {
-  // Simple: "mti-<ssrc-en-decimal>"
-  return `mti-${ssrc}`;
-}
+// sessionsByPort[port] = { port, uuid, udpSock, tcpSock, connected, queue, audioBuffer, lastRtpMs, ended, timer }
+const sessionsByPort = new Map();
 
-// === Gestión de sesiones por SSRC ===
-//
-// sessions[ssrc] = {
-//   ssrc,
-//   uuid,
-//   socket,
-//   connected,
-//   queue: [frameBuf, ...],
-//   audioBuffer: Buffer,
-//   lastRtpMs,
-//   ended,
-//   inactivityTimer
-// }
+function createSession(port, uuid) {
+  if (sessionsByPort.has(port)) {
+    throw new Error(`Port already registered: ${port}`);
+  }
 
-const sessions = new Map();
+  const udpSock = dgram.createSocket('udp4');
+  const tcpSock = new net.Socket();
 
-function ensureSession(ssrc) {
-  let sess = sessions.get(ssrc);
-  if (sess) return sess;
-
-  const uuid = mkUuidForSsrc(ssrc);
-  console.log(`[MTI-GW] New SSRC=${ssrc}, UUID=${uuid}`);
-
-  const socket = new net.Socket();
-
-  sess = {
-    ssrc,
+  const sess = {
+    port,
     uuid,
-    socket,
+    udpSock,
+    tcpSock,
     connected: false,
     queue: [],
     audioBuffer: Buffer.alloc(0),
@@ -103,68 +71,82 @@ function ensureSession(ssrc) {
     inactivityTimer: null
   };
 
-  sessions.set(ssrc, sess);
+  sessionsByPort.set(port, sess);
 
-  // Eventos del socket TCP
-  socket.on('connect', () => {
-    console.log(`[MTI-GW] TCP connected to ${MTI_HOST}:${MTI_PORT} for SSRC=${ssrc} UUID=${uuid}`);
+  // TCP events
+  tcpSock.on('connect', () => {
+    console.log(`[MTI-GW] TCP connected to ${MTI_HOST}:${MTI_PORT} port=${port} uuid=${uuid}`);
 
-    // 1) Enviamos frame de inicio TYPE=0x01 con UUID
     const payload = Buffer.from(uuid, 'utf8');
-    const frame   = buildFrame(0x01, payload);
-    socket.write(frame);
-    console.log(`[MTI-GW] Sent START frame (type=0x01, len=${payload.length}) SSRC=${ssrc}`);
+    tcpSock.write(buildFrame(0x01, payload));
+    console.log(`[MTI-GW] Sent START (0x01 len=${payload.length}) port=${port} uuid=${uuid}`);
 
-    // 2) Marcamos conectado y drenamos la cola de frames acumulados (audio)
     sess.connected = true;
-    if (sess.queue.length > 0) {
-      console.log(`[MTI-GW] Flushing ${sess.queue.length} queued frames for SSRC=${ssrc}`);
-      for (const f of sess.queue) {
-        socket.write(f);
-      }
+
+    if (sess.queue.length) {
+      console.log(`[MTI-GW] Flushing ${sess.queue.length} queued audio frames port=${port}`);
+      for (const f of sess.queue) tcpSock.write(f);
       sess.queue = [];
     }
 
-    // 3) Arrancamos watchdog de inactividad si no está
     if (!sess.inactivityTimer) {
       sess.inactivityTimer = setInterval(() => {
         const now = Date.now();
         if (!sess.ended && now - sess.lastRtpMs > INACTIVITY_MS) {
-          console.log(`[MTI-GW] Inactivity timeout for SSRC=${ssrc}, sending END`);
+          console.log(`[MTI-GW] Inactivity timeout port=${port} uuid=${uuid}`);
           sendEndAndClose(sess, 'inactivity');
         }
       }, 2000);
     }
   });
 
-  socket.on('error', (err) => {
-    console.error(`[MTI-GW] TCP error SSRC=${ssrc} UUID=${uuid}:`, err.message || err);
-    // En caso de error, marcamos sesión como terminada
+  tcpSock.on('error', (err) => {
+    console.error(`[MTI-GW] TCP error port=${port} uuid=${uuid}: ${err.message}`);
     sendEndAndClose(sess, 'tcp-error');
   });
 
-  socket.on('close', () => {
-    console.log(`[MTI-GW] TCP closed for SSRC=${ssrc} UUID=${uuid}`);
-    cleanupSession(ssrc, 'tcp-close');
+  tcpSock.on('close', () => {
+    cleanupSession(port, 'tcp-close');
   });
 
-  // Conectamos al servidor MTI
-  socket.connect(MTI_PORT, MTI_HOST);
+  // UDP listener
+  udpSock.on('message', (msg) => {
+    if (msg.length < 12) return;
+    const payload = rtpPayload(msg);
+    if (!payload) return;
+
+    sess.lastRtpMs = Date.now();
+
+    sess.audioBuffer = Buffer.concat([sess.audioBuffer, payload]);
+
+    while (sess.audioBuffer.length >= AUDIO_FRAME_SIZE) {
+      const chunk = sess.audioBuffer.subarray(0, AUDIO_FRAME_SIZE);
+      sess.audioBuffer = sess.audioBuffer.subarray(AUDIO_FRAME_SIZE);
+
+      const frame = buildFrame(0x12, chunk);
+      if (sess.ended) return;
+
+      if (sess.connected) tcpSock.write(frame);
+      else sess.queue.push(frame);
+    }
+  });
+
+  udpSock.on('listening', () => {
+    const a = udpSock.address();
+    console.log(`[MTI-GW] RTP listening on ${a.address}:${a.port} uuid=${uuid}`);
+  });
+
+  udpSock.on('error', (err) => {
+    console.error(`[MTI-GW] UDP error port=${port} uuid=${uuid}: ${err.message}`);
+    sendEndAndClose(sess, 'udp-error');
+  });
+
+  udpSock.bind(port, '0.0.0.0');
+
+  // connect TCP lazily on first RTP? No, conectamos ya:
+  tcpSock.connect(MTI_PORT, MTI_HOST);
 
   return sess;
-}
-
-function sendFrame(sess, type, payloadBuf) {
-  if (sess.ended) return; // no enviar nada después del END
-
-  const frame = buildFrame(type, payloadBuf);
-
-  if (sess.connected) {
-    sess.socket.write(frame);
-  } else {
-    // Todavía no se ha establecido la conexión TCP → encolamos
-    sess.queue.push(frame);
-  }
 }
 
 function sendEndAndClose(sess, reason) {
@@ -172,102 +154,76 @@ function sendEndAndClose(sess, reason) {
   sess.ended = true;
 
   try {
-    // TYPE=0x00, LENGTH=0, sin payload
-    const endFrame = buildFrame(0x00, Buffer.alloc(0));
     if (sess.connected) {
-      sess.socket.write(endFrame);
-      console.log(`[MTI-GW] Sent END frame (0x00) SSRC=${sess.ssrc} reason=${reason}`);
-    } else {
-      // Si nunca conectó, no tiene sentido mandar END, pero lo dejamos como log
-      console.log(`[MTI-GW] Marking END without TCP connect SSRC=${sess.ssrc} reason=${reason}`);
+      sess.tcpSock.write(buildFrame(0x00, Buffer.alloc(0)));
+      console.log(`[MTI-GW] Sent END (0x00) port=${sess.port} reason=${reason}`);
     }
-  } catch (e) {
-    console.error('[MTI-GW] Error sending END frame:', e.message || e);
-  }
+  } catch {}
 
-  try {
-    sess.socket.end();
-  } catch (e) {
-    // ignoramos
-  }
+  try { sess.tcpSock.end(); } catch {}
 }
 
-function cleanupSession(ssrc, why) {
-  const sess = sessions.get(ssrc);
+function cleanupSession(port, why) {
+  const sess = sessionsByPort.get(port);
   if (!sess) return;
 
-  console.log(`[MTI-GW] cleanupSession SSRC=${ssrc} UUID=${sess.uuid} reason=${why}`);
+  console.log(`[MTI-GW] cleanup port=${port} uuid=${sess.uuid} reason=${why}`);
 
-  if (sess.inactivityTimer) {
-    clearInterval(sess.inactivityTimer);
-  }
+  if (sess.inactivityTimer) clearInterval(sess.inactivityTimer);
 
+  try { sess.udpSock.close(); } catch {}
   try {
-    if (!sess.ended) {
-      // Si por cualquier motivo llegamos aquí sin haber enviado END, lo enviamos
-      sendEndAndClose(sess, why || 'cleanup');
-    }
-  } catch (e) {
-    // ignoramos
-  }
+    if (!sess.ended) sendEndAndClose(sess, why || 'cleanup');
+  } catch {}
 
-  sessions.delete(ssrc);
+  sessionsByPort.delete(port);
 }
 
-// === RTP listener ===
-const rtpSock = dgram.createSocket('udp4');
+// ---------- HTTP CONTROL SERVER ----------
+const httpServer = http.createServer((req, res) => {
+  const parsed = url.parse(req.url, true);
 
-rtpSock.on('message', (msg) => {
-  if (msg.length < 12) return;
+  if (parsed.pathname === '/register') {
+    const uuid = parsed.query.uuid;
+    const port = Number(parsed.query.port);
 
-  const ssrc    = msg.readUInt32BE(8);
-  const payload = rtpPayload(msg);
-  if (!payload) return;
+    if (!uuid || !port) {
+      res.statusCode = 400; return res.end('Missing uuid/port');
+    }
 
-  const sess = ensureSession(ssrc);
-
-  // Actualizamos timestamp de última trama
-  sess.lastRtpMs = Date.now();
-
-  // Acumulamos audio hasta tener múltiplos de 640 bytes (20ms)
-  sess.audioBuffer = Buffer.concat([sess.audioBuffer, payload]);
-
-  while (sess.audioBuffer.length >= AUDIO_FRAME_SIZE) {
-    const chunk = sess.audioBuffer.subarray(0, AUDIO_FRAME_SIZE);
-    sess.audioBuffer = sess.audioBuffer.subarray(AUDIO_FRAME_SIZE);
-
-    // Enviamos frame TYPE=0x12 con 640 bytes PCM
-    sendFrame(sess, 0x12, chunk);
+    try {
+      createSession(port, uuid);
+      console.log(`[MTI-GW] Registered port=${port} uuid=${uuid}`);
+      res.statusCode = 200; return res.end('OK');
+    } catch (e) {
+      res.statusCode = 409; return res.end(String(e.message || e));
+    }
   }
+
+  if (parsed.pathname === '/unregister') {
+    const port = Number(parsed.query.port);
+    if (!port) {
+      res.statusCode = 400; return res.end('Missing port');
+    }
+    cleanupSession(port, 'unregister');
+    res.statusCode = 200; return res.end('OK');
+  }
+
+  res.statusCode = 404; res.end('Not found');
 });
 
-rtpSock.on('listening', () => {
-  const addr = rtpSock.address();
-  console.log(
-    `[MTI-GW] RTP listening on ${addr.address}:${addr.port} ` +
-    `(esperando slin16@16k desde ExternalMedia MTI)`
-  );
+httpServer.listen(MTI_GW_HTTP_PORT, '0.0.0.0', () => {
+  console.log(`[MTI-GW] HTTP control listening on :${MTI_GW_HTTP_PORT} (/register /unregister)`);
 });
 
-rtpSock.on('error', (err) => {
-  console.error('[MTI-GW] RTP socket error:', err.message || err);
-});
-
-rtpSock.bind(MTI_RTP_PORT, '0.0.0.0');
-
-// Cierre limpio en shutdown
+// shutdown limpio
 process.on('SIGINT', () => {
-  console.log('[MTI-GW] SIGINT recibido, cerrando sesiones...');
-  for (const ssrc of sessions.keys()) {
-    cleanupSession(ssrc, 'process-sigint');
-  }
+  console.log('[MTI-GW] SIGINT closing sessions...');
+  for (const p of sessionsByPort.keys()) cleanupSession(p, 'sigint');
   process.exit(0);
 });
-
 process.on('SIGTERM', () => {
-  console.log('[MTI-GW] SIGTERM recibido, cerrando sesiones...');
-  for (const ssrc of sessions.keys()) {
-    cleanupSession(ssrc, 'process-sigterm');
-  }
+  console.log('[MTI-GW] SIGTERM closing sessions...');
+  for (const p of sessionsByPort.keys()) cleanupSession(p, 'sigterm');
   process.exit(0);
 });

@@ -1,15 +1,16 @@
-// tap-service.js
-// Microservicio que:
-//  1) expone /start_tap (HTTP) para que el dialplan lo llame con CURL()
-//  2) usa ARI para crear un SnoopChannel sobre el canal real
-//  3) crea un bridge por llamada y mete ahí:
-//       - el canal Snoop/*
-//       - uno o varios ExternalMedia hacia gateways RTP (mti, deepgram)
-//  4) NO entra en bucle porque solo trata como "snoop" a los canales Snoop/*
+// tap-service.js (OPCIÓN 2 DEFINITIVA + FIX ExternalMedia app real)
+//  1) expone /start_tap (HTTP)
+//  2) crea SnoopChannel sobre el canal real
+//  3) crea bridges + ExternalMedia
+//  4) Para MTI usa puerto RTP dinámico por llamada:
+//       - reserva puerto en rango
+//       - registra (uuid,puerto) en mti-gw por HTTP
+//       - ExternalMedia → RTP_HOST_MTI:PUERTO
 //
-// Gateways soportados (por configuración .env):
-//   - mti      → RTP_HOST_MTI      (cliente AudioSocket MTI)
-//   - deepgram → RTP_HOST_DEEPGRAM (tu gateway Deepgram)
+// FIX:
+//   ExternalMedia debe entrar a una app ARI EXISTENTE (TAP_APP_NAME),
+//   si no Asterisk lo cuelga al instante => Channel not found.
+//   Lo ignoramos en StasisStart por nombre UnicastRTP/ o role=em.
 
 const http   = require('http');
 const url    = require('url');
@@ -21,60 +22,131 @@ const {
   ARI_PASS,
   TAP_APP_NAME,
   TAP_HTTP_PORT,
-  RTP_HOST_MTI,        // ej: "192.168.1.65:40010"
-  RTP_HOST_DEEPGRAM    // ej: "192.168.1.65:40000"
+
+  RTP_HOST_MTI,
+  RTP_HOST_DEEPGRAM,
+
+  MTI_GW_HTTP_HOST,
+  MTI_GW_HTTP_PORT,
+
+  MTI_RTP_START,
+  MTI_RTP_END
 } = process.env;
 
 if (!ARI_URL || !ARI_USER || !ARI_PASS || !TAP_APP_NAME || !TAP_HTTP_PORT) {
-  console.error('[TAP] ❌ Faltan variables de entorno (ARI_URL, ARI_USER, ARI_PASS, TAP_APP_NAME, TAP_HTTP_PORT)');
+  console.error('[TAP] ❌ Missing env (ARI_URL, ARI_USER, ARI_PASS, TAP_APP_NAME, TAP_HTTP_PORT)');
   process.exit(1);
 }
 
-// Mapa de gateways disponibles
 const GATEWAYS = {
   mti: {
     name: 'mti',
-    rtpHost: RTP_HOST_MTI || null
+    rtpHost: RTP_HOST_MTI || null,
+    dynamicPort: true
   },
   deepgram: {
     name: 'deepgram',
-    rtpHost: RTP_HOST_DEEPGRAM || null
+    rtpHost: RTP_HOST_DEEPGRAM || null,
+    dynamicPort: false
   }
 };
 
-// Estado por sesión TAP (uuid)
-const sessions   = new Map(); // uuid -> { bridge, snoopId, emIds: [], ari }
-const chan2uuid  = new Map(); // channelId -> uuid (índice inverso para cleanup)
+const MTI_HTTP_HOST = MTI_GW_HTTP_HOST || 'mti-gw';
+const MTI_HTTP_PORT = Number(MTI_GW_HTTP_PORT || 9093);
+
+const RTP_START = Number(MTI_RTP_START || 41000);
+const RTP_END   = Number(MTI_RTP_END   || 41999);
+
+const usedPorts = new Set();
+
+function parseHostOnly(hostport) {
+  if (!hostport) return null;
+  const s = String(hostport).trim();
+  const idx = s.lastIndexOf(':');
+  if (idx > -1 && s.slice(idx + 1).match(/^\d+$/)) {
+    return s.slice(0, idx);
+  }
+  return s;
+}
+
+function allocPort() {
+  const maxTries = (RTP_END - RTP_START + 1);
+  for (let i = 0; i < maxTries; i++) {
+    const p = RTP_START + Math.floor(Math.random() * (RTP_END - RTP_START + 1));
+    if (!usedPorts.has(p)) {
+      usedPorts.add(p);
+      return p;
+    }
+  }
+  return null;
+}
+
+function freePort(p) {
+  if (!p) return;
+  usedPorts.delete(p);
+}
+
+function mtiHttp(pathname, qs) {
+  const q = new URLSearchParams(qs).toString();
+  const options = {
+    host: MTI_HTTP_HOST,
+    port: MTI_HTTP_PORT,
+    path: `${pathname}?${q}`,
+    method: 'GET',
+    timeout: 2000
+  };
+  return new Promise((resolve, reject) => {
+    const req = http.request(options, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => resolve({ status: res.statusCode, body: data }));
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.end();
+  });
+}
+
+const sessions = new Map();   // uuid -> { bridge, snoopId, emIds, emMeta, ari }
+const chan2uuid = new Map();  // channelId -> uuid
 
 const mapChan = (uuid, channelId) => {
   if (!uuid || !channelId) return;
   chan2uuid.set(channelId, uuid);
 };
-
 const unmapChan = (channelId) => {
   if (!channelId) return;
   chan2uuid.delete(channelId);
 };
-
 const findUuidByChannel = (channelId) => chan2uuid.get(channelId);
 
-// Limpieza de una sesión completa (bridge + snoop + EMs)
 const cleanupSession = async (uuid, why = 'cleanup') => {
   const sess = sessions.get(uuid);
-  if (!sess) return; // idempotente
+  if (!sess) return;
 
   console.log(`[TAP] cleanup uuid=${uuid} reason=${why}`);
 
-  const { bridge, snoopId, emIds, ari } = sess;
+  const { bridge, snoopId, emIds, emMeta, ari } = sess;
 
-  // Destruye bridge
-  if (bridge) {
-    try {
-      await bridge.destroy().catch(() => {});
-    } catch (_) {}
+  if (emMeta) {
+    for (const [emId, meta] of emMeta.entries()) {
+      if (meta?.gwName === 'mti' && meta?.rtpPort) {
+        try {
+          await mtiHttp('/unregister', { port: meta.rtpPort });
+          console.log(`[TAP] Unregistered MTI port=${meta.rtpPort} uuid=${uuid}`);
+        } catch (e) {
+          console.warn(`[TAP] unregister MTI failed port=${meta.rtpPort}: ${e.message}`);
+        } finally {
+          freePort(meta.rtpPort);
+        }
+      }
+    }
   }
 
-  // Helper: cuelga canal si sigue vivo
+  if (bridge) {
+    try { await bridge.destroy().catch(() => {}); } catch {}
+  }
+
   const hangupIfAlive = async (channelId, label) => {
     if (!channelId) return;
     try {
@@ -83,162 +155,158 @@ const cleanupSession = async (uuid, why = 'cleanup') => {
         console.log(`[TAP] Hanging up ${label} channelId=${channelId} uuid=${uuid}`);
         await ch.hangup().catch(() => {});
       }
-    } catch (_) {}
+    } catch {}
   };
 
   await hangupIfAlive(snoopId, 'snoop');
-
   if (Array.isArray(emIds)) {
-    for (const emId of emIds) {
-      await hangupIfAlive(emId, 'externalMedia');
-    }
+    for (const emId of emIds) await hangupIfAlive(emId, 'externalMedia');
   }
 
-  // Limpia índices inversos
   if (snoopId) unmapChan(snoopId);
-  if (Array.isArray(emIds)) {
-    for (const emId of emIds) {
-      if (emId) unmapChan(emId);
-    }
-  }
+  if (Array.isArray(emIds)) for (const emId of emIds) unmapChan(emId);
 
   sessions.delete(uuid);
 };
 
-// Parse lista de gateways desde query o args
 function parseGwList(raw) {
-  if (!raw) return ['mti']; // por defecto solo mti
+  if (!raw) return ['mti'];
   if (Array.isArray(raw)) raw = raw[0];
-  return String(raw)
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
+  return String(raw).split(',').map(s => s.trim()).filter(Boolean);
 }
 
-// Crea ExternalMedia para un gateway concreto siguiendo el patrón oficial:
-//   - se crea un Channel() local
-//   - se engancha a su 'StasisStart' para meterlo al bridge
-//   - se llama a externalMedia({ app: TAP_APP_NAME, ... })
-//   - el id del canal EM es externalChannel.id
-async function createExternalMediaForGw(ari, uuid, bridge, gwName) {
+// retry directo sobre addChannel
+async function addToBridgeWithRetry(bridge, channelId, tries = 12, delayMs = 80) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      await bridge.addChannel({ channel: channelId });
+      return true;
+    } catch (e) {
+      const msg = e?.message || '';
+      if (!/not found/i.test(msg)) throw e;
+      await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
+  throw new Error(`Channel not found after retry channelId=${channelId}`);
+}
+
+async function createExternalMediaForGw(ari, uuid, bridge, gwName, sess) {
   const gw = GATEWAYS[gwName];
   if (!gw) {
-    console.warn(`[TAP] Gateway desconocido gw=${gwName} uuid=${uuid}`);
+    console.warn(`[TAP] Unknown gateway gw=${gwName} uuid=${uuid}`);
     return null;
   }
   if (!gw.rtpHost) {
-    console.warn(`[TAP] Gateway ${gwName} sin RTP_HOST configurado (ignorado) uuid=${uuid}`);
+    console.warn(`[TAP] Gateway ${gwName} without RTP host configured uuid=${uuid}`);
     return null;
   }
 
-  console.log(`[TAP] ExternalMedia → gw=${gwName} host=${gw.rtpHost} uuid=${uuid}`);
+  let externalHost = gw.rtpHost;
+  let rtpPort = null;
 
-  // Creamos un objeto Channel específico para este EM
-  const externalChannel = ari.Channel();
+  if (gw.dynamicPort) {
+    rtpPort = allocPort();
+    if (!rtpPort) throw new Error('No free MTI RTP ports in range');
 
-  // Cuando este canal EM entre en Stasis(TAP_APP_NAME), lo añadimos al bridge
-  externalChannel.on('StasisStart', async (_evt, emChan) => {
-    try {
-      await bridge.addChannel({ channel: emChan.id });
-      console.log(`[TAP] EM channel ${emChan.id} añadido al bridge ${bridge.id} gw=${gwName} uuid=${uuid}`);
-    } catch (err) {
-      console.error(`[TAP] Error añadiendo EM ${emChan.id} al bridge ${bridge.id}:`, err?.message || err);
+    const hostOnly = parseHostOnly(gw.rtpHost);
+    externalHost = `${hostOnly}:${rtpPort}`;
+
+    const reg = await mtiHttp('/register', { uuid, port: rtpPort });
+    if (reg.status !== 200) {
+      freePort(rtpPort);
+      throw new Error(`MTI register failed status=${reg.status} body=${reg.body}`);
     }
-  });
 
-  // Lanzamos el ExternalMedia real
-  await externalChannel.externalMedia({
-    app: TAP_APP_NAME,                    // misma app ARI
-    appArgs: `${uuid},em,${gwName}`,      // por si quieres loguear/filtrar después
-    external_host: gw.rtpHost,            // ej: "192.168.1.65:40010"
+    console.log(`[TAP] MTI reserved port=${rtpPort} and registered uuid=${uuid}`);
+  }
+
+  console.log(`[TAP] ExternalMedia → gw=${gwName} host=${externalHost} uuid=${uuid}`);
+
+  // 👇 APP REAL: entra en TAP_APP_NAME con role=em
+  const em = await ari.channels.externalMedia({
+    app: TAP_APP_NAME,
+    appArgs: `${uuid},em,${gwName}`,
+    external_host: externalHost,
     format: 'slin16',
     transport: 'udp',
     encapsulation: 'rtp'
-    // direction: 'both' // opcional según versión de Asterisk
   });
 
-  // externalChannel.id es el id que usará Asterisk para el canal UnicastRTP/...
-  mapChan(uuid, externalChannel.id);
-  return externalChannel.id;
+  await addToBridgeWithRetry(bridge, em.id);
+
+  if (!sess.emMeta) sess.emMeta = new Map();
+  sess.emMeta.set(em.id, { gwName, rtpPort });
+
+  console.log(`[TAP] EM added to bridge em.id=${em.id} gw=${gwName} uuid=${uuid}`);
+
+  return em.id;
 }
 
 (async () => {
   const ari = await client.connect(ARI_URL, ARI_USER, ARI_PASS);
-  console.log('[TAP] Conectado a ARI en', ARI_URL, 'como', ARI_USER);
+  console.log('[TAP] Connected to ARI', ARI_URL, 'user', ARI_USER);
 
-  // === 1) Manejo de la app ARI TAP_APP_NAME ===
   ari.on('StasisStart', async (evt, ch) => {
     const app = evt.application;
-    if (app !== TAP_APP_NAME) return;  // ignoramos otras apps
+    if (app !== TAP_APP_NAME) return;
 
-    // *** CLAVE PARA EVITAR BUCLES ***
-    // Solo tratamos como "snoop" a canales cuyo nombre empieza por Snoop/
-    // (los ExternalMedia entran con nombre UnicastRTP/...)
-    if (!ch.name || !ch.name.startsWith('Snoop/')) {
-      console.log(`[TAP] StasisStart ignorado (no-Snoop): name=${ch.name} id=${ch.id}`);
+    const args = evt.args || [];
+    const uuid = args[0] || '(no-uuid)';
+    const role = args[1] || 'snoop';
+    const gwArg = args[2] || 'mti';
+
+    // ExternalMedia entra aquí también, pero lo ignoramos
+    if (role === 'em' || String(ch.name || '').startsWith('UnicastRTP/')) {
+      console.log(`[TAP] StasisStart ignored (EM): name=${ch.name} id=${ch.id} uuid=${uuid}`);
       return;
     }
 
-    const args   = evt.args || [];
-    const uuid   = args[0] || '(sin-uuid)';
-    const gwArg  = args[1] || 'mti';      // ej: "mti" o "mti,deepgram"
     const gwList = parseGwList(gwArg);
 
     console.log(`[TAP] StasisStart role=snoop ch=${ch.id} uuid=${uuid} gw=[${gwList.join(',')}]`);
 
-    // Registramos el canal snoop -> uuid
     mapChan(uuid, ch.id);
 
     try {
       let sess = sessions.get(uuid);
-      if (sess && sess.bridge) {
-        console.log(`[TAP] Sesión ya existente para uuid=${uuid}, reusando bridge.`);
-      } else {
-        sess = { bridge: null, snoopId: ch.id, emIds: [], ari };
+      if (!sess) {
+        sess = { bridge: null, snoopId: ch.id, emIds: [], emMeta: new Map(), ari };
         sessions.set(uuid, sess);
       }
 
-      // 1) Creamos bridge si no existe
       if (!sess.bridge) {
         const bridge = ari.Bridge();
         await bridge.create({ type: 'mixing' });
         sess.bridge = bridge;
-        sessions.set(uuid, sess);
-        console.log(`[TAP] Bridge creado ${bridge.id} para uuid=${uuid}`);
+        console.log(`[TAP] Bridge created id=${bridge.id} uuid=${uuid}`);
       }
 
       const bridge = sess.bridge;
 
-      // 2) Añadimos el snoop al bridge
       await bridge.addChannel({ channel: ch.id });
-      console.log('[TAP] Snoop añadido al bridge');
+      console.log('[TAP] Snoop added to bridge');
 
-      // 3) Creamos ExternalMedia para cada gateway
       for (const gwName of gwList) {
-        const emId = await createExternalMediaForGw(ari, uuid, bridge, gwName).catch(err => {
-          console.error(`[TAP] Error creando ExternalMedia para gw=${gwName} uuid=${uuid}:`, err?.message || err);
-          return null;
-        });
+        const emId = await createExternalMediaForGw(ari, uuid, bridge, gwName, sess);
         if (emId) {
           sess.emIds.push(emId);
+          mapChan(uuid, emId);
         }
       }
 
       sessions.set(uuid, sess);
 
-      // 4) Limpieza cuando el snoop salga de Stasis
       ch.on('StasisEnd', () => {
-        console.log(`[TAP] StasisEnd (snoop) channel=${ch.id} uuid=${uuid}`);
+        console.log(`[TAP] StasisEnd (snoop) ch=${ch.id} uuid=${uuid}`);
         cleanupSession(uuid, 'snoop-stasis-end');
       });
 
     } catch (err) {
-      console.error('[TAP] ❌ Error en flujo TAP (snoop):', err?.message || err);
+      console.error('[TAP] ❌ Error in TAP flow:', err?.message || err);
       await cleanupSession(uuid, 'exception');
     }
   });
 
-  // Limpieza adicional basada en eventos globales
   ari.on('ChannelHangupRequest', async (ev) => {
     const channelId = ev.channel?.id;
     const uuid = findUuidByChannel(channelId);
@@ -258,25 +326,21 @@ async function createExternalMediaForGw(ari, uuid, bridge, gwName) {
   });
 
   ari.start(TAP_APP_NAME);
-  console.log(`[TAP] Escuchando app ARI: ${TAP_APP_NAME}`);
+  console.log(`[TAP] Listening ARI app: ${TAP_APP_NAME}`);
 
-  // === 2) HTTP /start_tap → crea SnoopChannel ===
   const port = Number(TAP_HTTP_PORT);
   const server = http.createServer(async (req, res) => {
     const parsed = url.parse(req.url, true);
     if (parsed.pathname !== '/start_tap') {
-      res.statusCode = 404;
-      return res.end('Not found');
+      res.statusCode = 404; return res.end('Not found');
     }
 
-    const chan    = parsed.query.chan;
-    const uuid    = parsed.query.uuid;
-    const gwParam = parsed.query.gw || 'mti';  // por defecto
-    const gwList  = parseGwList(gwParam);
+    const chan = parsed.query.chan;
+    const uuid = parsed.query.uuid;
+    const gwParam = parsed.query.gw || 'mti';
 
     if (!chan || !uuid) {
-      res.statusCode = 400;
-      return res.end('Missing chan or uuid');
+      res.statusCode = 400; return res.end('Missing chan or uuid');
     }
 
     console.log(`[TAP] /start_tap chan=${chan} uuid=${uuid} gw=${gwParam}`);
@@ -286,20 +350,19 @@ async function createExternalMediaForGw(ari, uuid, bridge, gwName) {
         channelId: chan,
         app: TAP_APP_NAME,
         spy: 'both',
-        whisper: 'none',
-        appArgs: `${uuid},${gwList.join(',')}` // args[0]=uuid, args[1]=lista gateways
+        appArgs: `${uuid},snoop,${gwParam}`
       });
 
-      res.statusCode = 200;
-      res.end('OK');
+      res.statusCode = 200; res.end('OK');
     } catch (err) {
-      console.error('[TAP] ❌ Error en /start_tap snoopChannel:', err?.message || err);
-      res.statusCode = 500;
-      res.end('ERROR');
+      console.error('[TAP] ❌ Error creating SnoopChannel:', err?.message || err);
+      res.statusCode = 500; res.end('ERROR');
     }
   });
 
   server.listen(port, '0.0.0.0', () => {
-    console.log(`[TAP] HTTP server escuchando en :${port} (/start_tap)`);
+    console.log(`[TAP] HTTP listening on :${port} (/start_tap)`);
+    console.log(`[TAP] MTI dynamic RTP range ${RTP_START}-${RTP_END}`);
+    console.log(`[TAP] MTI register target http://${MTI_HTTP_HOST}:${MTI_HTTP_PORT}`);
   });
 })();
