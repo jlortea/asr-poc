@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 8px; }
+    #live { white-space: pre-wrap; line-height: 1.4; }
+    .final { opacity: .95; }
+    .partial { opacity: .65; }
+  </style>
+</head>
+<body>
+  <div id="live"></div>
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const uuid = params.get('uuid');
+    const socket = io({ query: { uuid }});
+    const live = document.getElementById('live');
+
+    let lastPartial = null;
+    socket.on('stt', ({text, isFinal}) => {
+      if (!text) return;
+      if (isFinal) {
+        if (lastPartial) { lastPartial.remove(); lastPartial = null; }
+        const p = document.createElement('div');
+        p.className = 'final';
+        p.textContent = text;
+        live.appendChild(p);
+      } else {
+        if (!lastPartial) {
+          lastPartial = document.createElement('div');
+          lastPartial.className = 'partial';
+          live.appendChild(lastPartial);
+        }
+        lastPartial.textContent = text;
+      }
+      live.scrollTop = live.scrollHeight;
+    });
+    socket.on('stt-end', () => {
+      const p = document.createElement('div');
+      p.className = 'final';
+      p.textContent = '[fin de transcripción]';
+      live.appendChild(p);
+    });
+  </script>
+</body>
+</html>
