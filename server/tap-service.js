@@ -3,15 +3,90 @@
 // - MTI mantiene comportamiento EXACTO:
 //     snoop spy=both, bridge mixing, EM dinámico con /register en mti-gw
 // - Deepgram:
-//     dual-snoop (in/out) + EM fijo a RTP_HOST_DEEPGRAM
+//     dual-snoop (in/out) + bridges por dir + EM fijo por dir a RTP_HOST_DEEPGRAM_IN/OUT
 //     signaling HTTP /register a deepgram-gw por cada stream (dir)
-// - FIX 1: single-flight bridge => evita 2 bridges por uuid con snoops simultáneos
-// - FIX 2: cleanup idempotente => evita logs / hangups duplicados
+// - FIX: cleanup idempotente + destroy bridges deepgram por dir
 // - Retrocompat si gw viene en lista (mti,deepgram): usa el primero
 
 const http   = require('http');
 const url    = require('url');
 const client = require('ari-client');
+const prom   = require('prom-client');
+
+// =======================================================
+// Prometheus metrics
+// =======================================================
+const register = prom.register;
+prom.collectDefaultMetrics({ register });
+
+const gTapSessionsActive = new prom.Gauge({
+  name: 'tap_sessions_active',
+  help: 'Active TAP sessions'
+});
+
+const cTapSessionsStarted = new prom.Counter({
+  name: 'tap_sessions_started_total',
+  help: 'TAP sessions started',
+  labelNames: ['gw']
+});
+
+const cTapSessionsEnded = new prom.Counter({
+  name: 'tap_sessions_ended_total',
+  help: 'TAP sessions ended',
+  labelNames: ['gw', 'reason']
+});
+
+const gTapEmActive = new prom.Gauge({
+  name: 'tap_em_channels_active',
+  help: 'Active ExternalMedia channels',
+  labelNames: ['gw', 'dir']
+});
+
+const cTapEmCreated = new prom.Counter({
+  name: 'tap_em_created_total',
+  help: 'ExternalMedia channels created',
+  labelNames: ['gw', 'dir']
+});
+
+const cTapEmDestroyed = new prom.Counter({
+  name: 'tap_em_destroyed_total',
+  help: 'ExternalMedia channels destroyed',
+  labelNames: ['gw', 'dir', 'reason']
+});
+
+const cTapGatewayHttpErrors = new prom.Counter({
+  name: 'tap_gateway_http_errors_total',
+  help: 'HTTP errors calling downstream gateways (MTI / Deepgram)',
+  labelNames: ['gw', 'op']
+});
+
+const cTapErrors = new prom.Counter({
+  name: 'tap_errors_total',
+  help: 'Unhandled errors in tap-service',
+  labelNames: ['place', 'gw']
+});
+
+const gTapMtiPortsInUse = new prom.Gauge({
+  name: 'tap_mti_ports_in_use',
+  help: 'MTI dynamic RTP ports currently allocated'
+});
+
+// 🔢 métricas básicas adicionales para el dashboard unificado
+const gTapSnoopActive = new prom.Gauge({
+  name: 'tap_snoop_active',
+  help: 'Active snoop channels (in/out, all gateways)'
+});
+
+const gTapExternalMediaActive = new prom.Gauge({
+  name: 'tap_externalmedia_active',
+  help: 'Active externalMedia channels (all gateways)'
+});
+
+const cTapCleanupTotal = new prom.Counter({
+  name: 'tap_cleanup_total',
+  help: 'cleanupSession calls',
+  labelNames: ['gw', 'reason']
+});
 
 // === ENV ===
 const {
@@ -22,7 +97,8 @@ const {
   TAP_HTTP_PORT,
 
   RTP_HOST_MTI,
-  RTP_HOST_DEEPGRAM,
+  RTP_HOST_DEEPGRAM_IN,
+  RTP_HOST_DEEPGRAM_OUT,
 
   MTI_GW_HTTP_HOST,
   MTI_GW_HTTP_PORT,
@@ -49,7 +125,8 @@ const GATEWAYS = {
   },
   deepgram: {
     name: 'deepgram',
-    rtpHost: RTP_HOST_DEEPGRAM || null, // ej: "192.168.1.65:40000"
+    rtpHostIn:  RTP_HOST_DEEPGRAM_IN  || null,
+    rtpHostOut: RTP_HOST_DEEPGRAM_OUT || null,
     dynamicPort: false
   }
 };
@@ -59,7 +136,6 @@ const MTI_HTTP_HOST = MTI_GW_HTTP_HOST || 'mti-gw';
 const MTI_HTTP_PORT = Number(MTI_GW_HTTP_PORT || 9093);
 
 // === Deepgram HTTP signaling target ===
-// por defecto usa el service docker deepgram-gw escuchando en WIDGET_PORT interno (8080)
 const DG_HTTP_HOST = DEEPGRAM_GW_HTTP_HOST || 'deepgram-gw';
 const DG_HTTP_PORT = Number(DEEPGRAM_GW_HTTP_PORT || 8080);
 
@@ -71,7 +147,7 @@ const usedPorts = new Set();
 // === STATE ===
 // uuid -> session
 // MTI: { gw:'mti', bridge, snoopId, emIds[], emMeta(Map), ari, cleaned? }
-// Deepgram: { gw:'deepgram', bridge, bridgePromise?, emIds[], emMeta(Map), ari,
+// Deepgram: { gw:'deepgram', bridges{in,out}, bridgePromises{in,out}, emIds[], emMeta(Map), ari,
 //             exten, caller, callername, cleaned? }
 const sessions = new Map();
 
@@ -120,6 +196,7 @@ function allocPort() {
     const p = RTP_START + Math.floor(Math.random() * (RTP_END - RTP_START + 1));
     if (!usedPorts.has(p)) {
       usedPorts.add(p);
+      gTapMtiPortsInUse.set(usedPorts.size);
       return p;
     }
   }
@@ -129,6 +206,7 @@ function allocPort() {
 function freePort(p) {
   if (!p) return;
   usedPorts.delete(p);
+  gTapMtiPortsInUse.set(usedPorts.size);
 }
 
 function mtiHttp(pathname, qs) {
@@ -146,8 +224,14 @@ function mtiHttp(pathname, qs) {
       res.on('data', c => data += c);
       res.on('end', () => resolve({ status: res.statusCode, body: data }));
     });
-    req.on('error', reject);
-    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', (err) => {
+      cTapGatewayHttpErrors.inc({ gw: 'mti', op: pathname });
+      reject(err);
+    });
+    req.on('timeout', () => {
+      cTapGatewayHttpErrors.inc({ gw: 'mti', op: pathname });
+      req.destroy(new Error('timeout'));
+    });
     req.end();
   });
 }
@@ -167,8 +251,14 @@ function deepgramHttp(pathname, qs) {
       res.on('data', ()=>{});
       res.on('end', () => resolve(res.statusCode));
     });
-    req.on('error', reject);
-    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', (err) => {
+      cTapGatewayHttpErrors.inc({ gw: 'deepgram', op: pathname });
+      reject(err);
+    });
+    req.on('timeout', () => {
+      cTapGatewayHttpErrors.inc({ gw: 'deepgram', op: pathname });
+      req.destroy(new Error('timeout'));
+    });
     req.end();
   });
 }
@@ -188,8 +278,7 @@ async function addToBridgeWithRetry(bridge, channelId, tries = 12, delayMs = 80)
   throw new Error(`Channel not found after retry channelId=${channelId}`);
 }
 
-// FIX 1: single-flight bridge (evita doble bridge cuando entran in/out a la vez)
-// FIX: bridge por dirección para Deepgram (evita mezcla)
+// bridge por dirección para Deepgram (evita mezcla)
 async function getOrCreateBridgeDir(sess, ari, uuid, dir, tag='DG') {
   if (!sess.bridges) sess.bridges = {};
   if (!sess.bridgePromises) sess.bridgePromises = {};
@@ -211,7 +300,7 @@ async function getOrCreateBridgeDir(sess, ari, uuid, dir, tag='DG') {
 }
 
 // =======================
-// Cleanup (idempotente)  FIX 2
+// Cleanup (idempotente)
 // =======================
 const cleanupSession = async (uuid, why = 'cleanup') => {
   const sess = sessions.get(uuid);
@@ -222,11 +311,31 @@ const cleanupSession = async (uuid, why = 'cleanup') => {
 
   console.log(`[TAP] cleanup uuid=${uuid} gw=${sess.gw} reason=${why}`);
 
+  // métrica global de cleanup
+  cTapCleanupTotal.inc({
+    gw: sess.gw || 'unknown',
+    reason: why || 'unknown'
+  });
+
   const { bridge, snoopId, emIds, emMeta, ari } = sess;
 
-  // MTI unregister dynamic ports
+  // metric: session ended
+  cTapSessionsEnded.inc({
+    gw: sess.gw || 'unknown',
+    reason: why || 'unknown'
+  });
+
+  // EM metrics + MTI unregister dynamic ports
   if (emMeta) {
     for (const [emId, meta] of emMeta.entries()) {
+      const gwName = meta?.gwName || sess.gw || 'unknown';
+      const dir    = meta?.dir || 'both';
+
+      // EM destroyed
+      cTapEmDestroyed.inc({ gw: gwName, dir, reason: why || 'cleanup' });
+      gTapEmActive.dec({ gw: gwName, dir });
+      gTapExternalMediaActive.dec();
+
       if (meta?.gwName === 'mti' && meta?.rtpPort) {
         try {
           await mtiHttp('/unregister', { port: meta.rtpPort });
@@ -240,7 +349,7 @@ const cleanupSession = async (uuid, why = 'cleanup') => {
     }
   }
 
-  // ✅ NUEVO: Deepgram unregister por uuid (solo si la sesión es deepgram)
+  // Deepgram unregister por uuid
   if (sess.gw === 'deepgram') {
     try {
       await deepgramHttp('/unregister', { uuid });
@@ -260,8 +369,7 @@ const cleanupSession = async (uuid, why = 'cleanup') => {
     }
   }
 
-
-  // ahora ya destruimos bridge y colgamos canales
+  // destruir bridge MTI (si existe)
   if (bridge) {
     try { await bridge.destroy().catch(() => {}); } catch {}
   }
@@ -277,8 +385,10 @@ const cleanupSession = async (uuid, why = 'cleanup') => {
     } catch {}
   };
 
+  // cuelga snoops
   await hangupIfAlive(snoopId, 'snoop');
 
+  // cuelga EM
   if (Array.isArray(emIds)) {
     for (const emId of emIds) await hangupIfAlive(emId, 'externalMedia');
   }
@@ -287,8 +397,8 @@ const cleanupSession = async (uuid, why = 'cleanup') => {
   if (Array.isArray(emIds)) for (const emId of emIds) unmapChan(emId);
 
   sessions.delete(uuid);
+  gTapSessionsActive.set(sessions.size);
 };
-
 
 // =======================
 // ExternalMedia factory (MTI / Deepgram)
@@ -299,14 +409,29 @@ async function createExternalMediaForGw(ari, uuid, bridge, gwName, sess, dir = '
     console.warn(`[TAP] Unknown gateway gw=${gwName} uuid=${uuid}`);
     return null;
   }
-  if (!gw.rtpHost) {
-    console.warn(`[TAP] Gateway ${gwName} without RTP host configured uuid=${uuid}`);
+
+  // validar host según gateway
+  if (gwName === 'mti' && !gw.rtpHost) {
+    console.warn(`[TAP] Gateway mti without RTP host configured uuid=${uuid}`);
+    return null;
+  }
+  if (gwName === 'deepgram' && (!gw.rtpHostIn || !gw.rtpHostOut)) {
+    console.warn(`[TAP] Gateway deepgram without RTP host IN/OUT configured uuid=${uuid}`);
     return null;
   }
 
-  let externalHost = gw.rtpHost;
+  // externalHost base
+  let externalHost = (gwName === 'mti') ? gw.rtpHost : gw.rtpHostIn;
   let rtpPort = null;
 
+  // Deepgram por-dir (dual-port)
+  if (gwName === 'deepgram') {
+    if (dir === 'in') externalHost = gw.rtpHostIn;
+    else if (dir === 'out') externalHost = gw.rtpHostOut;
+    else externalHost = gw.rtpHostIn; // fallback
+  }
+
+  // MTI dynamic port + register
   if (gw.dynamicPort) {
     rtpPort = allocPort();
     if (!rtpPort) throw new Error('No free MTI RTP ports in range');
@@ -323,7 +448,7 @@ async function createExternalMediaForGw(ari, uuid, bridge, gwName, sess, dir = '
     console.log(`[TAP][MTI] reserved port=${rtpPort} uuid=${uuid}`);
   }
 
-  // signaling a deepgram-gw antes de crear EM (solo deepgram)
+  // signaling Deepgram antes de crear EM
   if (gwName === 'deepgram') {
     try {
       await deepgramHttp('/register', {
@@ -341,9 +466,7 @@ async function createExternalMediaForGw(ari, uuid, bridge, gwName, sess, dir = '
 
   console.log(`[TAP] ExternalMedia → gw=${gwName} host=${externalHost} uuid=${uuid} dir=${dir}`);
 
-  // APP REAL: entra en TAP_APP_NAME con role=em
-  // Para MTI dejamos args clásicos: `${uuid},em,mti`
-  // Para Deepgram añadimos metadata + dir
+  // appArgs
   let emArgs;
   if (gwName === 'mti') {
     emArgs = `${uuid},em,mti`;
@@ -365,6 +488,11 @@ async function createExternalMediaForGw(ari, uuid, bridge, gwName, sess, dir = '
   if (!sess.emMeta) sess.emMeta = new Map();
   sess.emMeta.set(em.id, { gwName, rtpPort, dir });
 
+  // métricas EM
+  cTapEmCreated.inc({ gw: gwName, dir });
+  gTapEmActive.inc({ gw: gwName, dir });
+  gTapExternalMediaActive.inc();
+
   console.log(`[TAP] EM added em.id=${em.id} gw=${gwName} uuid=${uuid}`);
   return em.id;
 }
@@ -382,9 +510,11 @@ async function handleSnoopMTI({ ari, ch, uuid }) {
   if (!sess) {
     sess = { gw: 'mti', bridge: null, snoopId: ch.id, emIds: [], emMeta: new Map(), ari };
     sessions.set(uuid, sess);
+    cTapSessionsStarted.inc({ gw: 'mti' });
+    gTapSessionsActive.set(sessions.size);
   }
 
-  // Bridge mixing (igual que antes)
+  // Bridge mixing MTI
   if (!sess.bridge) {
     const bridge = ari.Bridge();
     await bridge.create({ type: 'mixing' });
@@ -394,11 +524,9 @@ async function handleSnoopMTI({ ari, ch, uuid }) {
 
   const bridge = sess.bridge;
 
-  // Añade snoop a bridge
   await bridge.addChannel({ channel: ch.id });
   console.log('[TAP][MTI] Snoop added to bridge');
 
-  // EM MTI dinámico
   const emId = await createExternalMediaForGw(ari, uuid, bridge, 'mti', sess);
   if (emId) {
     sess.emIds.push(emId);
@@ -422,9 +550,8 @@ async function handleSnoopDeepgram({ ari, ch, uuid, exten, caller, callername, d
   if (!sess) {
     sess = {
       gw: 'deepgram',
-      bridge: null,
-      bridgePromise: null,
-      snoopId: null,
+      bridges: null,
+      bridgePromises: null,
       emIds: [],
       emMeta: new Map(),
       ari,
@@ -433,22 +560,21 @@ async function handleSnoopDeepgram({ ari, ch, uuid, exten, caller, callername, d
       callername
     };
     sessions.set(uuid, sess);
+    cTapSessionsStarted.inc({ gw: 'deepgram' });
+    gTapSessionsActive.set(sessions.size);
   } else {
-    // refresca metadata si llega en el segundo snoop
     sess.exten = exten || sess.exten;
     sess.caller = caller || sess.caller;
     sess.callername = callername || sess.callername;
   }
 
-  // FIX 1: bridge single-flight
-  // ✅ bridge independiente por cada dir
+  // bridge independiente por cada dir
   const bridge = await getOrCreateBridgeDir(sess, ari, uuid, dir, 'DG');
 
   await bridge.addChannel({ channel: ch.id });
   console.log(`[TAP][DG] Snoop added to bridge dir=${dir} bridge=${bridge.id}`);
 
   const emId = await createExternalMediaForGw(ari, uuid, bridge, 'deepgram', sess, dir);
-
   if (emId) {
     sess.emIds.push(emId);
     mapChan(uuid, emId);
@@ -470,8 +596,7 @@ async function handleSnoopDeepgram({ ari, ch, uuid, exten, caller, callername, d
   console.log('[TAP] Connected to ARI', ARI_URL, 'user', ARI_USER);
 
   ari.on('StasisStart', async (evt, ch) => {
-    const app = evt.application;
-    if (app !== TAP_APP_NAME) return;
+    if (evt.application !== TAP_APP_NAME) return;
 
     const args = evt.args || [];
     const uuid = args[0] || '(no-uuid)';
@@ -483,11 +608,14 @@ async function handleSnoopDeepgram({ ari, ch, uuid, exten, caller, callername, d
     const callername = args[5] || '';
     const dir        = args[6] || 'both'; // in/out para deepgram
 
-    // ExternalMedia entra también aquí, pero lo ignoramos siempre
+    // Ignorar ExternalMedia re-entries
     if (role === 'em' || String(ch.name || '').startsWith('UnicastRTP/')) {
       console.log(`[TAP] StasisStart ignored (EM): name=${ch.name} id=${ch.id} uuid=${uuid}`);
       return;
     }
+
+    // métrica de snoop activo (uno por canal snoop)
+    gTapSnoopActive.inc();
 
     try {
       if (gw === 'mti') {
@@ -499,6 +627,7 @@ async function handleSnoopDeepgram({ ari, ch, uuid, exten, caller, callername, d
       }
     } catch (err) {
       console.error('[TAP] ❌ Error in GW flow:', err?.message || err);
+      cTapErrors.inc({ place: 'stasis_start', gw });
       await cleanupSession(uuid, 'exception');
     }
   });
@@ -517,6 +646,15 @@ async function handleSnoopDeepgram({ ari, ch, uuid, exten, caller, callername, d
     const channelId = ch?.id;
     const uuid = findUuidByChannel(channelId);
     if (uuid) {
+      const name = String(ch?.name || '');
+      const isEm = name.startsWith('UnicastRTP/');
+
+      // si el canal que termina es un snoop, decrementamos
+      if (!isEm) {
+        gTapSnoopActive.dec();
+      }
+      // (externalMedia ya se descuenta en cleanupSession vía emMeta)
+
       console.log(`[TAP] StasisEnd (global) channel=${channelId} uuid=${uuid}`);
       await cleanupSession(uuid, 'global-stasis-end');
     }
@@ -525,10 +663,18 @@ async function handleSnoopDeepgram({ ari, ch, uuid, exten, caller, callername, d
   ari.start(TAP_APP_NAME);
   console.log(`[TAP] Listening ARI app: ${TAP_APP_NAME}`);
 
-  // HTTP /start_tap
+  // HTTP /start_tap + /metrics
   const port = Number(TAP_HTTP_PORT);
   const server = http.createServer(async (req, res) => {
     const parsed = url.parse(req.url, true);
+
+    // Endpoint Prometheus
+    if (parsed.pathname === '/metrics') {
+      res.statusCode = 200;
+      res.setHeader('Content-Type', register.contentType);
+      return res.end(await register.metrics());
+    }
+
     if (parsed.pathname !== '/start_tap') {
       res.statusCode = 404; return res.end('Not found');
     }
@@ -537,7 +683,6 @@ async function handleSnoopDeepgram({ ari, ch, uuid, exten, caller, callername, d
     const uuid = parsed.query.uuid;
     const gw   = normalizeGw(parsed.query.gw);
 
-    // metadata opcional (solo deepgram)
     const exten      = parsed.query.exten || '';
     const caller     = parsed.query.caller || '';
     const callername = parsed.query.callername || '';
@@ -550,7 +695,6 @@ async function handleSnoopDeepgram({ ari, ch, uuid, exten, caller, callername, d
 
     try {
       if (gw === 'mti') {
-        // 🔒 Retrocompatible: un único snoop spy=both
         await ari.channels.snoopChannel({
           channelId: chan,
           app: TAP_APP_NAME,
@@ -558,7 +702,6 @@ async function handleSnoopDeepgram({ ari, ch, uuid, exten, caller, callername, d
           appArgs: `${uuid},snoop,mti`
         });
       } else if (gw === 'deepgram') {
-        // ✅ Dual snoop estricto
         const baseArgs = `${uuid},snoop,deepgram,${exten},${caller},${callername}`;
 
         await ari.channels.snoopChannel({
@@ -575,7 +718,6 @@ async function handleSnoopDeepgram({ ari, ch, uuid, exten, caller, callername, d
           appArgs: `${baseArgs},out`
         });
       } else {
-        // fallback
         await ari.channels.snoopChannel({
           channelId: chan,
           app: TAP_APP_NAME,
@@ -587,15 +729,17 @@ async function handleSnoopDeepgram({ ari, ch, uuid, exten, caller, callername, d
       res.statusCode = 200; res.end('OK');
     } catch (err) {
       console.error('[TAP] ❌ Error creating SnoopChannel:', err?.message || err);
+      cTapErrors.inc({ place: 'start_tap', gw });
       res.statusCode = 500; res.end('ERROR');
     }
   });
 
   server.listen(port, '0.0.0.0', () => {
-    console.log(`[TAP] HTTP listening on :${port} (/start_tap)`);
+    console.log(`[TAP] HTTP listening on :${port} (/start_tap, /metrics)`);
     console.log(`[TAP] MTI dynamic RTP range ${RTP_START}-${RTP_END}`);
     console.log(`[TAP] MTI register target http://${MTI_HTTP_HOST}:${MTI_HTTP_PORT}`);
-    console.log(`[TAP] Deepgram RTP host ${RTP_HOST_DEEPGRAM || '(not set)'}`);
+    console.log(`[TAP] Deepgram RTP host IN  ${RTP_HOST_DEEPGRAM_IN  || '(not set)'}`);
+    console.log(`[TAP] Deepgram RTP host OUT ${RTP_HOST_DEEPGRAM_OUT || '(not set)'}`);
     console.log(`[TAP] Deepgram register target http://${DG_HTTP_HOST}:${DG_HTTP_PORT}`);
   });
 })();

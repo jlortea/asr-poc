@@ -4,6 +4,7 @@
   "private": true,
   "type": "commonjs",
   "dependencies": {
-    "ari-client": "^2.2.0"
+    "ari-client": "^2.2.0",
+    "prom-client": "^15.0.0"
   }
 }

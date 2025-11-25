@@ -24,14 +24,13 @@ services:
       - ./public:/app/public
       - ./gw-package.json:/app/gw-package.json:ro
     ports:
-      - "18080:8080"        # widget (HTTP)
-      - "40000:40000/udp"   # RTP/UDP publicado (gateway Deepgram)
+      - "18080:8080"        # widget (HTTP) + /metrics
+      - "40000:40000/udp"   # RTP IN
+      - "40001:40001/udp"   # RTP OUT
     restart: unless-stopped
 
   ##########################################
   # GATEWAY MTI (mti-gw)  — RTP dinámico por llamada
-  # Opción 2: puertos UDP dinámicos + /register
-  # Recomendado: network_mode: host para escuchar el rango completo sin publicarlo.
   ##########################################
   mti-gw:
     env_file:
@@ -39,24 +38,17 @@ services:
     image: node:20-alpine
     working_dir: /app
     command: ["sh","-c","cp /app/gw-package.json /app/package.json && npm install --omit=dev && node server/mti-gw.js"]
-
-    # MUY IMPORTANTE:
-    # Con host network el contenedor escucha directamente en el host los UDP dinámicos,
-    # por eso NO hay ports: para UDP.
     network_mode: host
-
     environment:
       - MTI_HOST=${MTI_HOST}
       - MTI_PORT=${MTI_PORT}
-
-      # rango de puertos dinámicos (solo informativo aquí, el que lo usa es tap-service)
       - MTI_RTP_START=${MTI_RTP_START}
       - MTI_RTP_END=${MTI_RTP_END}
-
     volumes:
       - ./server:/app/server
       - ./gw-package.json:/app/gw-package.json:ro
-
+    ports:
+      - "9093:9093"  # /metrics
     restart: unless-stopped
 
   ##########################################
@@ -76,7 +68,6 @@ services:
       - TAP_HTTP_PORT=${TAP_HTTP_PORT}
       - RTP_HOST_MTI=${RTP_HOST_MTI}
       - RTP_HOST_DEEPGRAM=${RTP_HOST_DEEPGRAM}
-      # opcional, solo por claridad
       - MTI_RTP_START=${MTI_RTP_START}
       - MTI_RTP_END=${MTI_RTP_END}
       - MTI_GW_HTTP_HOST=${MTI_GW_HTTP_HOST}
@@ -85,5 +76,46 @@ services:
       - ./server:/app/server
       - ./tap-package.json:/app/tap-package.json:ro
     ports:
-      - "3200:3200/tcp"   # /start_tap para el dialplan (CURL)
+      - "3200:3200/tcp"   # /start_tap + /metrics
     restart: unless-stopped
+
+  ##########################################
+  # PROMETHEUS (persistente)
+  ##########################################
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.size=5GB
+
+
+  ##########################################
+  # GRAFANA (persistente)
+  ##########################################
+  grafana:
+    image: grafana/grafana:10.4.1
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3000:3000"  # Dashboard UI
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+
+volumes:
+  prometheus_data:
+  grafana_data:

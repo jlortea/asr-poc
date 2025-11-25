@@ -8,6 +8,7 @@ const dgram = require('dgram');
 const net   = require('net');
 const http  = require('http');
 const url   = require('url');
+const prom  = require('prom-client');
 
 const MTI_HOST = process.env.MTI_HOST || '127.0.0.1';
 const MTI_PORT = Number(process.env.MTI_PORT || 9092);
@@ -22,6 +23,74 @@ if (!MTI_HOST || !MTI_PORT) {
 
 const AUDIO_FRAME_SIZE = 640;
 const INACTIVITY_MS    = 8000;
+
+// =======================================================
+// Prometheus metrics
+// =======================================================
+const register = prom.register;
+prom.collectDefaultMetrics({ register });
+
+const gSessions = new prom.Gauge({
+  name: 'mti_sessions_active',
+  help: 'Active MTI GW sessions'
+});
+
+const gPortsInUse = new prom.Gauge({
+  name: 'mti_ports_in_use',
+  help: 'UDP ports in use for RTP (1 port = 1 session)'
+});
+
+const cSessionsCreated = new prom.Counter({
+  name: 'mti_sessions_created_total',
+  help: 'MTI GW sessions created'
+});
+
+const cSessionsEnded = new prom.Counter({
+  name: 'mti_sessions_ended_total',
+  help: 'MTI GW sessions ended',
+  labelNames: ['reason']
+});
+
+const cRtpPackets = new prom.Counter({
+  name: 'mti_rtp_packets_total',
+  help: 'RTP packets received'
+});
+
+const cRtpBytes = new prom.Counter({
+  name: 'mti_rtp_bytes_total',
+  help: 'RTP payload bytes received'
+});
+
+const cHttpRegister = new prom.Counter({
+  name: 'mti_http_register_total',
+  help: 'HTTP /register calls'
+});
+
+const cHttpUnregister = new prom.Counter({
+  name: 'mti_http_unregister_total',
+  help: 'HTTP /unregister calls'
+});
+
+const cHttpErrors = new prom.Counter({
+  name: 'mti_http_errors_total',
+  help: 'HTTP control errors',
+  labelNames: ['path', 'code']
+});
+
+const cTcpErrors = new prom.Counter({
+  name: 'mti_tcp_errors_total',
+  help: 'TCP errors towards MTI server'
+});
+
+const cUdpErrors = new prom.Counter({
+  name: 'mti_udp_errors_total',
+  help: 'UDP socket errors'
+});
+
+const cInactivityTimeouts = new prom.Counter({
+  name: 'mti_inactivity_total',
+  help: 'Number of inactivity timeouts in MTI GW'
+});
 
 // RTP payload extractor
 function rtpPayload(buf) {
@@ -50,6 +119,12 @@ function buildFrame(type, payloadBuf) {
 // sessionsByPort[port] = { port, uuid, udpSock, tcpSock, connected, queue, audioBuffer, lastRtpMs, ended, timer }
 const sessionsByPort = new Map();
 
+function updateSessionGauges() {
+  const size = sessionsByPort.size;
+  gSessions.set(size);
+  gPortsInUse.set(size);
+}
+
 function createSession(port, uuid) {
   if (sessionsByPort.has(port)) {
     throw new Error(`Port already registered: ${port}`);
@@ -72,6 +147,8 @@ function createSession(port, uuid) {
   };
 
   sessionsByPort.set(port, sess);
+  cSessionsCreated.inc();
+  updateSessionGauges();
 
   // TCP events
   tcpSock.on('connect', () => {
@@ -90,18 +167,20 @@ function createSession(port, uuid) {
     }
 
     if (!sess.inactivityTimer) {
-      sess.inactivityTimer = setInterval(() => {
-        const now = Date.now();
-        if (!sess.ended && now - sess.lastRtpMs > INACTIVITY_MS) {
-          console.log(`[MTI-GW] Inactivity timeout port=${port} uuid=${uuid}`);
-          sendEndAndClose(sess, 'inactivity');
-        }
-      }, 2000);
-    }
+    sess.inactivityTimer = setInterval(() => {
+      const now = Date.now();
+      if (!sess.ended && now - sess.lastRtpMs > INACTIVITY_MS) {
+        console.log(`[MTI-GW] Inactivity timeout port=${port} uuid=${uuid}`);
+        cInactivityTimeouts.inc();                    // <<< nuevo
+        sendEndAndClose(sess, 'inactivity');
+      }
+    }, 2000);
+   }
   });
 
   tcpSock.on('error', (err) => {
     console.error(`[MTI-GW] TCP error port=${port} uuid=${uuid}: ${err.message}`);
+    cTcpErrors.inc();
     sendEndAndClose(sess, 'tcp-error');
   });
 
@@ -116,6 +195,10 @@ function createSession(port, uuid) {
     if (!payload) return;
 
     sess.lastRtpMs = Date.now();
+
+    // métricas RTP
+    cRtpPackets.inc();
+    cRtpBytes.inc(payload.length);
 
     sess.audioBuffer = Buffer.concat([sess.audioBuffer, payload]);
 
@@ -138,12 +221,13 @@ function createSession(port, uuid) {
 
   udpSock.on('error', (err) => {
     console.error(`[MTI-GW] UDP error port=${port} uuid=${uuid}: ${err.message}`);
+    cUdpErrors.inc();
     sendEndAndClose(sess, 'udp-error');
   });
 
   udpSock.bind(port, '0.0.0.0');
 
-  // connect TCP lazily on first RTP? No, conectamos ya:
+  // connect TCP ya
   tcpSock.connect(MTI_PORT, MTI_HOST);
 
   return sess;
@@ -169,6 +253,8 @@ function cleanupSession(port, why) {
 
   console.log(`[MTI-GW] cleanup port=${port} uuid=${sess.uuid} reason=${why}`);
 
+  cSessionsEnded.inc({ reason: why || 'cleanup' });
+
   if (sess.inactivityTimer) clearInterval(sess.inactivityTimer);
 
   try { sess.udpSock.close(); } catch {}
@@ -177,35 +263,51 @@ function cleanupSession(port, why) {
   } catch {}
 
   sessionsByPort.delete(port);
+  updateSessionGauges();
 }
 
 // ---------- HTTP CONTROL SERVER ----------
-const httpServer = http.createServer((req, res) => {
+const httpServer = http.createServer(async (req, res) => {
   const parsed = url.parse(req.url, true);
+
+  // Prometheus endpoint
+  if (parsed.pathname === '/metrics') {
+    res.statusCode = 200;
+    res.setHeader('Content-Type', register.contentType);
+    return res.end(await register.metrics());
+  }
 
   if (parsed.pathname === '/register') {
     const uuid = parsed.query.uuid;
     const port = Number(parsed.query.port);
 
     if (!uuid || !port) {
-      res.statusCode = 400; return res.end('Missing uuid/port');
+      res.statusCode = 400;
+      cHttpErrors.inc({ path: '/register', code: '400' });
+      return res.end('Missing uuid/port');
     }
 
     try {
       createSession(port, uuid);
       console.log(`[MTI-GW] Registered port=${port} uuid=${uuid}`);
+      cHttpRegister.inc();
       res.statusCode = 200; return res.end('OK');
     } catch (e) {
-      res.statusCode = 409; return res.end(String(e.message || e));
+      res.statusCode = 409;
+      cHttpErrors.inc({ path: '/register', code: '409' });
+      return res.end(String(e.message || e));
     }
   }
 
   if (parsed.pathname === '/unregister') {
     const port = Number(parsed.query.port);
     if (!port) {
-      res.statusCode = 400; return res.end('Missing port');
+      res.statusCode = 400;
+      cHttpErrors.inc({ path: '/unregister', code: '400' });
+      return res.end('Missing port');
     }
     cleanupSession(port, 'unregister');
+    cHttpUnregister.inc();
     res.statusCode = 200; return res.end('OK');
   }
 
@@ -213,7 +315,7 @@ const httpServer = http.createServer((req, res) => {
 });
 
 httpServer.listen(MTI_GW_HTTP_PORT, '0.0.0.0', () => {
-  console.log(`[MTI-GW] HTTP control listening on :${MTI_GW_HTTP_PORT} (/register /unregister)`);
+  console.log(`[MTI-GW] HTTP control listening on :${MTI_GW_HTTP_PORT} (/register /unregister /metrics)`);
 });
 
 // shutdown limpio

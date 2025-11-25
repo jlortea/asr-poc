@@ -4,10 +4,59 @@
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
-    body { font: 14px system-ui, sans-serif; margin: 8px; }
-    #live { white-space: pre-wrap; line-height: 1.4; max-height: 95vh; overflow-y: auto; }
-    .final { opacity: .95; margin: 2px 0; }
-    .partial { opacity: .65; margin: 2px 0; }
+    body {
+      font: 14px system-ui, sans-serif;
+      margin: 8px;
+      background: #0b0c0f;
+      color: #e8e8ea;
+    }
+
+    #live {
+      white-space: pre-wrap;
+      line-height: 1.45;
+      max-height: 95vh;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .line {
+      padding: 6px 8px;
+      border-radius: 8px;
+      box-shadow: 0 0 0 1px rgba(255,255,255,0.04) inset;
+    }
+
+    .final { opacity: .98; }
+    .partial { opacity: .65; }
+
+    /* 🎨 Fondo por interlocutor */
+    .caller {
+      background: rgba(60, 120, 255, 0.18);
+    }
+    .agent {
+      background: rgba(60, 220, 140, 0.16);
+    }
+
+    .meta {
+      font-weight: 600;
+      margin-right: 6px;
+      opacity: .95;
+    }
+
+    .time {
+      font-variant-numeric: tabular-nums;
+      opacity: .75;
+      margin-right: 6px;
+    }
+
+    .sys {
+      background: rgba(255,255,255,0.06);
+      opacity: .8;
+      font-style: italic;
+      padding: 6px 8px;
+      border-radius: 8px;
+    }
   </style>
 </head>
 <body>
@@ -16,51 +65,104 @@
   <script src="/socket.io/socket.io.js"></script>
   <script>
     const params = new URLSearchParams(location.search);
-
-    // ✅ room por extensión (fallback a 'mix')
     const exten = params.get('exten') || 'mix';
 
-    // ✅ por retrocompat del server, usamos query.uuid como room
+    // retrocompat: server usa query.uuid como room
     const socket = io({ query: { uuid: exten } });
-
     const live = document.getElementById('live');
 
-    function addLine(text, cls) {
-      const p = document.createElement('div');
-      p.className = cls;
-      p.textContent = text;
-      live.appendChild(p);
-      live.scrollTop = live.scrollHeight;
-      return p;
-    }
-
+    let currentUuid = null;
     let lastPartial = null;
     let lastPartialSpeaker = null;
 
-    socket.on('stt', ({ text, isFinal, speaker }) => {
+    function nowTime() {
+      // HH:MM:SS 24h
+      return new Date().toLocaleTimeString('es-ES', { hour12: false });
+    }
+
+    function clearLive() {
+      live.innerHTML = '';
+      lastPartial = null;
+      lastPartialSpeaker = null;
+    }
+
+    function addLine({ text, cls, speaker, type }) {
+      const div = document.createElement('div');
+      div.className = `line ${cls} ${type || ''}`;
+
+      const t = document.createElement('span');
+      t.className = 'time';
+      t.textContent = `[${nowTime()}]`;
+
+      const m = document.createElement('span');
+      m.className = 'meta';
+      m.textContent = speaker ? `[${speaker}]` : '';
+
+      const x = document.createElement('span');
+      x.textContent = text;
+
+      div.appendChild(t);
+      if (speaker) div.appendChild(m);
+      div.appendChild(x);
+
+      live.appendChild(div);
+      live.scrollTop = live.scrollHeight;
+      return div;
+    }
+
+    function addSys(text) {
+      const div = document.createElement('div');
+      div.className = 'sys';
+      div.textContent = `[${nowTime()}] ${text}`;
+      live.appendChild(div);
+      live.scrollTop = live.scrollHeight;
+      return div;
+    }
+
+    socket.on('call-start', ({ uuid, caller, callername }) => {
+      if (uuid && uuid !== currentUuid) {
+        clearLive();
+        currentUuid = uuid;
+        const who = callername || caller || 'Caller';
+        addSys(`Nueva llamada: ${who} → ${exten}`);
+      }
+    });
+
+    socket.on('stt', ({ text, isFinal, speaker, dir }) => {
       if (!text) return;
-      const prefix = speaker ? `[${speaker}] ` : '';
+
+      const type = (dir === 'in') ? 'caller'
+                  : (dir === 'out') ? 'agent'
+                  : null;
 
       if (isFinal) {
         if (lastPartial) { lastPartial.remove(); lastPartial = null; }
-        addLine(prefix + text, 'final');
+        addLine({ text, cls: 'final', speaker, type });
         lastPartialSpeaker = null;
       } else {
         if (!lastPartial || lastPartialSpeaker !== speaker) {
           if (lastPartial) lastPartial.remove();
-          lastPartial = addLine(prefix + text, 'partial');
+          lastPartial = addLine({ text, cls: 'partial', speaker, type });
           lastPartialSpeaker = speaker;
         } else {
-          lastPartial.textContent = prefix + text;
+          // actualiza parcial existente manteniendo timestamp original visualmente
+          const spans = lastPartial.querySelectorAll('span');
+          const timeSpan = spans[0];
+          const metaSpan = spans[1];
+          const textSpan = spans[2] || spans[1];
+
+          if (metaSpan && speaker) metaSpan.textContent = `[${speaker}]`;
+          textSpan.textContent = text;
         }
+        live.scrollTop = live.scrollHeight;
       }
     });
 
     socket.on('stt-end', () => {
-      addLine('[fin de transcripción]', 'final');
+      addSys('fin de transcripción');
     });
 
-    console.log('[Widget] conectado a room/exten:', exten);
+    console.log('[Widget] room/exten:', exten);
   </script>
 </body>
 </html>

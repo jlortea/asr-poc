@@ -6,6 +6,7 @@
   "dependencies": {
     "express": "^4.19.2",
     "socket.io": "^4.7.5",
-    "ws": "^8.16.0"
+    "ws": "^8.16.0",
+    "prom-client": "^15.0.0"
   }
 }

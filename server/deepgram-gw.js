@@ -1,10 +1,15 @@
-// deepgram-gw.js (REFAC separado)
-// - Recibe RTP/UDP fijo (slin16@16kHz L-E) desde Asterisk ExternalMedia
-// - Mantiene sesiones concurrentes por SSRC
-// - Cada SSRC abre su propio WS a Deepgram
-// - Signaling HTTP /register para inyectar contexto por stream (uuid, exten, caller, dir)
-// - Enruta transcripts a "room" = exten (un widget por extensión)
-// - Diarización estricta local: dir=in => Caller, dir=out => Agent
+// deepgram-gw.js (NEXT: dual-port, strict diarization, rooms per exten, metrics, reconnect)
+// - Receives RTP slin16@16kHz on two fixed UDP ports:
+//     RTP_PORT_IN  => dir=in (Caller)
+//     RTP_PORT_OUT => dir=out (Agent)
+// - /register injects context (uuid, exten, caller, callername) per call.
+// - Sessions keyed by SSRC, dir is fixed by port (no mixing / no heuristics).
+// - One Deepgram WS per SSRC.
+// - Broadcasts transcripts to Socket.IO room = exten.
+// - Emits "call-start" on /register so widget can auto-clear.
+// - Prometheus metrics at /metrics
+// - WS reconnect with exponential backoff + jitter
+// - DG_MAX_SESSIONS limit (from env)
 
 const dgram     = require('dgram');
 const WebSocket = require('ws');
@@ -12,6 +17,7 @@ const express   = require('express');
 const http      = require('http');
 const { Server }= require('socket.io');
 const fs        = require('fs');
+const prom      = require('prom-client');
 
 // === ENV ===
 const DG_KEY       = process.env.DEEPGRAM_API_KEY;
@@ -19,23 +25,62 @@ const DG_LANG      = process.env.DG_LANGUAGE || 'es';
 const DG_INTERIM   = (process.env.DG_INTERIM || 'true') === 'true';
 const DG_PUNCT     = (process.env.DG_PUNCTUATE || 'true') === 'true';
 const DG_SMART     = (process.env.DG_SMART_FORMAT || 'true') === 'true';
-const DG_DIARIZE   = (process.env.DG_DIARIZE || 'false') === 'true'; // puedes dejar false
+const DG_DIARIZE   = (process.env.DG_DIARIZE || 'false') === 'true';
 
 const WIDGET_PORT  = Number(process.env.WIDGET_PORT || 8080);
-const RTP_PORT     = Number(process.env.RTP_PORT || 40000);
+
+const RTP_PORT_IN  = Number(process.env.RTP_PORT_IN  || 40000);
+const RTP_PORT_OUT = Number(process.env.RTP_PORT_OUT || 40001);
+
+const DG_MAX_SESSIONS = Number(process.env.DG_MAX_SESSIONS || 3);
 
 const SWAP_ENDIAN  = (process.env.SWAP_ENDIAN || '0') === '1';
 const DUMP_WAV     = (process.env.DUMP_WAV || '0') === '1';
 
 if (!DG_KEY) {
-  console.error('[DG-GW] ❌ Falta DEEPGRAM_API_KEY');
+  console.error('[DG-GW] ❌ Missing DEEPGRAM_API_KEY');
   process.exit(1);
 }
 
-// === Web + Socket.IO (widget) ===
+// =======================================================
+// Prometheus metrics
+// =======================================================
+const register = prom.register;
+prom.collectDefaultMetrics({ register });
+
+const gSessions = new prom.Gauge({
+  name: 'dg_sessions_active',
+  help: 'Active RTP->Deepgram sessions',
+  registers: [register]
+});
+
+const cRtpPackets = new prom.Counter({
+  name: 'dg_rtp_packets_total',
+  help: 'Total RTP packets received',
+  labelNames: ['dir'],
+  registers: [register]
+});
+
+const cWsReconnects = new prom.Counter({
+  name: 'dg_ws_reconnects_total',
+  help: 'Total Deepgram WS reconnect attempts',
+  registers: [register]
+});
+
+const cZeroPcmFrames = new prom.Counter({
+  name: 'dg_zero_frames_total',
+  help: 'Zero PCM frames (all samples are 0)',
+  labelNames: ['dir'],
+  registers: [register]
+});
+
+// =======================================================
+// Web + Socket.IO (widget)
+// =======================================================
 const app = express();
 const httpServer = http.createServer(app);
 const io = new Server(httpServer, { cors: { origin: '*' } });
+
 app.use(express.static('public'));
 
 httpServer.listen(WIDGET_PORT, () => {
@@ -43,29 +88,32 @@ httpServer.listen(WIDGET_PORT, () => {
 });
 
 io.on('connection', (s) => {
-  const { uuid } = s.handshake.query; // por retrocompat widget usa "uuid" como room; aquí será exten
+  // retrocompat: widget sends query.uuid = room name (exten)
+  const { uuid } = s.handshake.query;
   if (uuid) s.join(uuid);
   console.log(`[Widget] socket conectado room=${uuid || '(sin room)'}`);
 });
 
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', register.contentType);
+  res.end(await register.metrics());
+});
+
 // =======================================================
-// Signaling: /register desde TAP solo para Deepgram
+// Signaling: /register from TAP
 // =======================================================
 
-// uuid -> { exten, caller, callername, streams:{inSSRC,outSSRC}, lastTs }
+// uuid -> { exten, caller, callername, lastTs }
 const ctxByUuid = new Map();
 
-// Cola de asignación SSRC para streams recién creados
-// dir -> [{ uuid, ts }]
+// pending per dir, to bind next SSRC on that dir to uuid
 const pendingByDir = { in: [], out: [] };
-
-const PENDING_TTL_MS = 2500;
+const PENDING_TTL_MS = 4000;
 
 function pushPending(dir, uuid) {
   if (!(dir === 'in' || dir === 'out')) return;
   const now = Date.now();
   pendingByDir[dir].push({ uuid, ts: now });
-  // limpia expirados
   pendingByDir[dir] = pendingByDir[dir].filter(x => now - x.ts < PENDING_TTL_MS);
 }
 
@@ -80,6 +128,8 @@ app.get('/register', (req, res) => {
   const { uuid, exten, caller, callername, dir } = req.query;
   if (!uuid) return res.status(400).send('missing uuid');
 
+  const isNew = !ctxByUuid.has(uuid);
+
   let ctx = ctxByUuid.get(uuid);
   if (!ctx) {
     ctx = {
@@ -87,7 +137,6 @@ app.get('/register', (req, res) => {
       exten: exten || 'mix',
       caller: caller || '',
       callername: callername || '',
-      streams: {},
       lastTs: Date.now()
     };
     ctxByUuid.set(uuid, ctx);
@@ -99,6 +148,17 @@ app.get('/register', (req, res) => {
   }
 
   if (dir === 'in' || dir === 'out') pushPending(dir, uuid);
+
+  // Emit call-start so widget can auto-clear on new call
+  if (isNew || req.query.force_start === '1') {
+    io.to(ctx.exten).emit('call-start', {
+      uuid,
+      exten: ctx.exten,
+      caller: ctx.caller,
+      callername: ctx.callername,
+      ts: Date.now()
+    });
+  }
 
   console.log(`[DG-GW] register uuid=${uuid} exten=${ctx.exten} caller=${ctx.caller} dir=${dir}`);
   res.send('OK');
@@ -114,8 +174,17 @@ app.get('/unregister', (req, res) => {
 });
 
 // =======================================================
-// Deepgram WS
+// Deepgram WS + reconnect/backoff
 // =======================================================
+const RECONNECT_BASE_MS = 500;
+const RECONNECT_MAX_MS  = 8000;
+
+function nextBackoffMs(attempt) {
+  const ms = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * (2 ** attempt));
+  const jitter = Math.floor(Math.random() * 200);
+  return ms + jitter;
+}
+
 function dgConnect(sampleRate = 16000, lang = DG_LANG) {
   const qs = new URLSearchParams({
     encoding: 'linear16',
@@ -133,7 +202,6 @@ function dgConnect(sampleRate = 16000, lang = DG_LANG) {
   ws.on('open', () => {
     const s = ws._tapSess;
     console.log(`[DG] WS open ssrc=${s?.ssrc} uuid=${s?.uuid} dir=${s?.dir} room=${s?.room}`);
-    // flush boot
     if (s?.boot?.length) {
       for (const chunk of s.boot) ws.send(chunk, { binary: true });
       s.boot.length = 0;
@@ -171,17 +239,30 @@ function dgConnect(sampleRate = 16000, lang = DG_LANG) {
   });
 
   ws.on('error', err => console.error('[DG] WS error:', err?.message || err));
-  ws.on('close', (code, reason) => {
+
+  ws.on('close', () => {
     const s = ws._tapSess;
-    console.log(`[DG] WS close ssrc=${s?.ssrc} uuid=${s?.uuid} dir=${s?.dir} code=${code}`);
-    if (s?.room) io.to(s.room).emit('stt-end', {});
+    if (!s || s.closing) return;
+
+    const attempt = s.reconnects++;
+    const waitMs = nextBackoffMs(attempt);
+
+    console.warn(`[DG] WS closed ssrc=${s.ssrc} dir=${s.dir} -> reconnect in ${waitMs}ms (attempt ${attempt+1})`);
+    cWsReconnects.inc();
+
+    setTimeout(() => {
+      if (!rtpSessions.has(s.ssrc)) return; // session already gone
+      const newWs = dgConnect(16000, DG_LANG);
+      s.ws = newWs;
+      newWs._tapSess = s;
+    }, waitMs);
   });
 
   return ws;
 }
 
 // =======================================================
-// WAV dump opcional (~5s)
+// WAV dump (~5s) optional
 // =======================================================
 let wavWrite = null, wavBytes = 0, wavSamples = 0;
 function wavBegin(sr = 16000, tag='capture') {
@@ -223,16 +304,17 @@ process.on('exit', () => wavEnd(16000));
 process.on('SIGINT', () => { wavEnd(16000); process.exit(0); });
 
 // =======================================================
-// RTP receiver (UDP)
+// RTP receiver (dual UDP)
 // =======================================================
-const rtpSock = dgram.createSocket('udp4');
+const rtpSockIn  = dgram.createSocket('udp4');
+const rtpSockOut = dgram.createSocket('udp4');
 
-// SSRC -> sess
-// sess = { ssrc, ws, room, uuid, dir, exten, caller, callername, boot[], last, timer, pkts, bytes, zeros }
+// SSRC -> session
+// { ssrc, ws, room, uuid, dir, exten, caller, callername, boot[], last, timer, pkts, bytes, zeros, reconnects, closing }
 const rtpSessions = new Map();
 
-const BOOT_FRAMES = 50;    // ~1s
-const INACT_MS    = 8000;  // watchdog
+const BOOT_FRAMES = 50;
+const INACT_MS    = 8000;
 
 function rtpPayload(buf) {
   if (buf.length < 12) return null;
@@ -263,31 +345,43 @@ function isAllZero16(buf) {
   return true;
 }
 
-// asigna contexto a SSRC nuevo usando pendingByDir
-function resolveContextForNewSSRC() {
-  const pin  = popPending('in');
-  if (pin) {
-    const ctx = ctxByUuid.get(pin.uuid);
-    return { uuid: pin.uuid, dir: 'in', ctx };
+function resolveContextForNewSSRC(dir) {
+  const p = popPending(dir);
+  if (p) {
+    const ctx = ctxByUuid.get(p.uuid);
+    return { uuid: p.uuid, ctx };
   }
-  const pout = popPending('out');
-  if (pout) {
-    const ctx = ctxByUuid.get(pout.uuid);
-    return { uuid: pout.uuid, dir: 'out', ctx };
-  }
-  return { uuid: 'unknown', dir: 'unknown', ctx: null };
+  return { uuid: 'unknown', ctx: null };
 }
 
-function ensureSess(ssrc) {
+function startWatchdog(sess) {
+  sess.timer = setInterval(() => {
+    if (Date.now() - sess.last > INACT_MS) {
+      console.log(`[DG-GW] SSRC=${sess.ssrc} dir=${sess.dir} inactive -> close`);
+      sess.closing = true;
+      try { sess.ws.close(); } catch {}
+      clearInterval(sess.timer);
+      rtpSessions.delete(sess.ssrc);
+      gSessions.set(rtpSessions.size);
+    }
+  }, 2000);
+}
+
+function ensureSess(ssrc, dir) {
   let sess = rtpSessions.get(ssrc);
   if (sess) return sess;
 
-  const { uuid, dir, ctx } = resolveContextForNewSSRC();
+  if (rtpSessions.size >= DG_MAX_SESSIONS) {
+    console.warn(`[DG-GW] max sessions reached (${DG_MAX_SESSIONS}). Dropping SSRC=${ssrc} dir=${dir}`);
+    return null;
+  }
+
+  const { uuid, ctx } = resolveContextForNewSSRC(dir);
 
   const exten      = ctx?.exten || 'mix';
   const caller     = ctx?.caller || '';
   const callername = ctx?.callername || '';
-  const room       = exten; // ✅ room por extensión
+  const room       = exten;
 
   const ws = dgConnect(16000, DG_LANG);
 
@@ -305,67 +399,74 @@ function ensureSess(ssrc) {
     timer: null,
     pkts: 0,
     bytes: 0,
-    zeros: 0
+    zeros: 0,
+    reconnects: 0,
+    closing: false
   };
 
   ws._tapSess = sess;
   rtpSessions.set(ssrc, sess);
+  gSessions.set(rtpSessions.size);
 
-  console.log(`[DG-GW] Started session SSRC=${ssrc} uuid=${uuid} dir=${dir} room=${room}`);
+  console.log(`[DG-GW] Started session dir=${dir} SSRC=${ssrc} uuid=${uuid} room=${room}`);
 
-  sess.timer = setInterval(() => {
-    if (Date.now() - sess.last > INACT_MS) {
-      console.log(`[DG-GW] SSRC=${ssrc} inactivo → close`);
-      try { ws.close(); } catch {}
-      clearInterval(sess.timer);
-      rtpSessions.delete(ssrc);
-    }
-  }, 2000);
-
-  ws.on('close', () => {
-    if (sess.timer) clearInterval(sess.timer);
-    rtpSessions.delete(ssrc);
-  });
-
+  startWatchdog(sess);
   return sess;
 }
 
-rtpSock.on('message', (msg) => {
-  if (msg.length < 12) return;
+function onRtpMessage(dir) {
+  return (msg) => {
+    if (msg.length < 12) return;
 
-  const ssrc = msg.readUInt32BE(8);
-  const payload = rtpPayload(msg);
-  if (!payload) return;
+    const ssrc = msg.readUInt32BE(8);
+    const payload = rtpPayload(msg);
+    if (!payload) return;
 
-  const sess = ensureSess(ssrc);
+    const sess = ensureSess(ssrc, dir);
+    if (!sess) return;
 
-  sess.pkts++;
-  sess.bytes += payload.length;
-  sess.last = Date.now();
+    sess.pkts++;
+    sess.bytes += payload.length;
+    sess.last = Date.now();
 
-  let pcm = Buffer.from(payload);
-  if (isAllZero16(pcm)) sess.zeros++;
-  pcm = maybeSwapEndian(pcm);
+    cRtpPackets.inc({ dir });
 
-  if (DUMP_WAV) {
-    if (!wavWrite) wavBegin(16000, `ssrc-${ssrc}`);
-    wavAppend(pcm);
-  }
+    let pcm = Buffer.from(payload);
+    if (isAllZero16(pcm)) {
+	    sess.zeros++;
+	    cZeroPcmFrames.inc({ dir });
+    }
+    pcm = maybeSwapEndian(pcm);
 
-  if (sess.ws.readyState === WebSocket.OPEN) {
-    sess.ws.send(pcm, { binary: true });
-  } else if (sess.boot.length < BOOT_FRAMES) {
-    sess.boot.push(pcm);
-  }
+    if (DUMP_WAV) {
+      if (!wavWrite) wavBegin(16000, `ssrc-${ssrc}-${dir}`);
+      wavAppend(pcm);
+    }
 
-  if (sess.pkts % 100 === 0) {
-    console.log(`[RTP] SSRC=${ssrc} pkts=${sess.pkts} bytes=${sess.bytes} zeros=${sess.zeros} ws=${sess.ws.readyState} room=${sess.room} dir=${sess.dir}`);
-  }
+    if (sess.ws.readyState === WebSocket.OPEN) {
+      sess.ws.send(pcm, { binary: true });
+    } else if (sess.boot.length < BOOT_FRAMES) {
+      sess.boot.push(pcm);
+    }
+
+    if (sess.pkts % 100 === 0) {
+      console.log(
+        `[RTP] dir=${dir} SSRC=${ssrc} pkts=${sess.pkts} bytes=${sess.bytes} zeros=${sess.zeros} ` +
+        `ws=${sess.ws.readyState} room=${sess.room}`
+      );
+    }
+  };
+}
+
+rtpSockIn.on('message', onRtpMessage('in'));
+rtpSockOut.on('message', onRtpMessage('out'));
+
+rtpSockIn.bind(RTP_PORT_IN, '0.0.0.0', () => {
+  const a = rtpSockIn.address();
+  console.log(`[DG-GW] RTP IN listening on ${a.address}:${a.port} (slin16 ${SWAP_ENDIAN?'swap':'LE'})`);
 });
 
-rtpSock.on('listening', () => {
-  const addr = rtpSock.address();
-  console.log(`[DG-GW] RTP listening on ${addr.address}:${addr.port} (slin16 ${SWAP_ENDIAN?'swap':'LE'})`);
+rtpSockOut.bind(RTP_PORT_OUT, '0.0.0.0', () => {
+  const a = rtpSockOut.address();
+  console.log(`[DG-GW] RTP OUT listening on ${a.address}:${a.port} (slin16 ${SWAP_ENDIAN?'swap':'LE'})`);
 });
-
-rtpSock.bind(RTP_PORT, '0.0.0.0');
