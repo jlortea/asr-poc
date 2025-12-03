@@ -1,12 +1,14 @@
 // tap-service.js (REFAC retrocompatible, MTI aislado, Deepgram separado + fixes)
 // - /start_tap router por gw: mti | deepgram
-// - MTI mantiene comportamiento EXACTO:
+// - MTI mantiene comportamiento EXACTO en audio:
 //     snoop spy=both, bridge mixing, EM dinámico con /register en mti-gw
 // - Deepgram:
 //     dual-snoop (in/out) + bridges por dir + EM fijo por dir a RTP_HOST_DEEPGRAM_IN/OUT
 //     signaling HTTP /register a deepgram-gw por cada stream (dir)
 // - FIX: cleanup idempotente + destroy bridges deepgram por dir
 // - Retrocompat si gw viene en lista (mti,deepgram): usa el primero
+// - EXTENSIÓN MTI: /register hacia mti-gw incluye metadatos de agente
+//      (agent_extension, agent_username, agent_id) para el START frame JSON.
 
 const http   = require('http');
 const url    = require('url');
@@ -146,10 +148,15 @@ const usedPorts = new Set();
 
 // === STATE ===
 // uuid -> session
-// MTI: { gw:'mti', bridge, snoopId, emIds[], emMeta(Map), ari, cleaned? }
+// MTI: { gw:'mti', bridge, snoopId, emIds[], emMeta(Map), ari, cleaned?,
+//        agent_extension, agent_username, agent_id }
 // Deepgram: { gw:'deepgram', bridges{in,out}, bridgePromises{in,out}, emIds[], emMeta(Map), ari,
 //             exten, caller, callername, cleaned? }
 const sessions = new Map();
+
+// uuid -> { agent_extension, agent_username, agent_id }
+// Solo usado para MTI: metadatos que queremos mandar al mti-gw en /register
+const mtiAgentByUuid = new Map();
 
 // map channelId -> uuid (para cleanup por eventos)
 const chan2uuid = new Map();
@@ -398,6 +405,9 @@ const cleanupSession = async (uuid, why = 'cleanup') => {
 
   sessions.delete(uuid);
   gTapSessionsActive.set(sessions.size);
+
+  // Limpieza de metadatos MTI
+  mtiAgentByUuid.delete(uuid);
 };
 
 // =======================
@@ -439,13 +449,27 @@ async function createExternalMediaForGw(ari, uuid, bridge, gwName, sess, dir = '
     const hostOnly = parseHostOnly(gw.rtpHost);
     externalHost = `${hostOnly}:${rtpPort}`;
 
-    const reg = await mtiHttp('/register', { uuid, port: rtpPort });
+    // Metadatos opcionales de agente (si no existen, enviamos "" según especificación MTI)
+    const agent_extension = (sess.agent_extension || '');
+    const agent_username  = (sess.agent_username || '');
+    const agent_id        = (sess.agent_id || '');
+
+    const reg = await mtiHttp('/register', {
+      uuid,
+      port: rtpPort,
+      agent_extension,
+      agent_username,
+      agent_id
+    });
     if (reg.status !== 200) {
       freePort(rtpPort);
       throw new Error(`MTI register failed status=${reg.status} body=${reg.body}`);
     }
 
-    console.log(`[TAP][MTI] reserved port=${rtpPort} uuid=${uuid}`);
+    console.log(
+      `[TAP][MTI] reserved port=${rtpPort} uuid=${uuid} ` +
+      `agent_extension=${agent_extension} agent_username=${agent_username} agent_id=${agent_id}`
+    );
   }
 
   // signaling Deepgram antes de crear EM
@@ -508,7 +532,19 @@ async function handleSnoopMTI({ ari, ch, uuid }) {
 
   let sess = sessions.get(uuid);
   if (!sess) {
-    sess = { gw: 'mti', bridge: null, snoopId: ch.id, emIds: [], emMeta: new Map(), ari };
+    // Recuperamos metadatos opcionales para MTI (si los hubiera)
+    const meta = mtiAgentByUuid.get(uuid) || {};
+    sess = {
+      gw: 'mti',
+      bridge: null,
+      snoopId: ch.id,
+      emIds: [],
+      emMeta: new Map(),
+      ari,
+      agent_extension: meta.agent_extension || '',
+      agent_username: meta.agent_username || '',
+      agent_id: meta.agent_id || ''
+    };
     sessions.set(uuid, sess);
     cTapSessionsStarted.inc({ gw: 'mti' });
     gTapSessionsActive.set(sessions.size);
@@ -683,15 +719,36 @@ async function handleSnoopDeepgram({ ari, ch, uuid, exten, caller, callername, d
     const uuid = parsed.query.uuid;
     const gw   = normalizeGw(parsed.query.gw);
 
+    // Campos usados para Deepgram (widget) y/o MTI (metadatos de agente)
     const exten      = parsed.query.exten || '';
     const caller     = parsed.query.caller || '';
     const callername = parsed.query.callername || '';
+
+    // Campos específicos MTI (opcionales, string opaco)
+    // Si no vienen, usamos fallback razonable:
+    //  - agent_extension: exten
+    //  - agent_username / agent_id: vacío
+    const agent_extension = parsed.query.agent_extension || exten || '';
+    const agent_username  = parsed.query.agent_username  || '';
+    const agent_id        = parsed.query.agent_id        || '';
 
     if (!chan || !uuid) {
       res.statusCode = 400; return res.end('Missing chan or uuid');
     }
 
-    console.log(`[TAP] /start_tap chan=${chan} uuid=${uuid} gw=${gw} exten=${exten} caller=${caller}`);
+    console.log(
+      `[TAP] /start_tap chan=${chan} uuid=${uuid} gw=${gw} ` +
+      `exten=${exten} caller=${caller} agent_extension=${agent_extension} agent_username=${agent_username} agent_id=${agent_id}`
+    );
+
+    // Guardamos metadatos MTI para usarlos más tarde cuando creemos el EM y llamemos a mti-gw /register
+    if (gw === 'mti') {
+      mtiAgentByUuid.set(uuid, {
+        agent_extension,
+        agent_username,
+        agent_id
+      });
+    }
 
     try {
       if (gw === 'mti') {

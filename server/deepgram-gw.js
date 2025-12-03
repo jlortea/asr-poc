@@ -18,6 +18,8 @@ const http      = require('http');
 const { Server }= require('socket.io');
 const fs        = require('fs');
 const prom      = require('prom-client');
+const https     = require('https');
+const { URL }   = require('url');
 
 // === ENV ===
 const DG_KEY       = process.env.DEEPGRAM_API_KEY;
@@ -36,6 +38,28 @@ const DG_MAX_SESSIONS = Number(process.env.DG_MAX_SESSIONS || 3);
 
 const SWAP_ENDIAN  = (process.env.SWAP_ENDIAN || '0') === '1';
 const DUMP_WAV     = (process.env.DUMP_WAV || '0') === '1';
+
+// Cómo interpretar dir=in / dir=out respecto a agente/cliente
+// - 'CALLER_IN' (por defecto): dir=in = cliente (caller), dir=out = agente (exten)
+// - 'AGENT_IN' : dir=in = agente (exten), dir=out = cliente (caller)
+const DG_ROLE_MODE = process.env.DG_ROLE_MODE || 'CALLER_IN';
+console.log('[DG-GW] DG_ROLE_MODE=${DG_ROLE_MODE}');
+
+
+
+// ==================================================================
+// GEN-ASSISTANT: configuración (no cambia comportamiento por defecto)
+// ==================================================================
+const GENERATIVE_ASSISTANT = (process.env.GENERATIVE_ASSISTANT || 'false') === 'true';
+const SHOW_TRANSCRIPTION   = (process.env.SHOW_TRANSCRIPTION   || 'true')  === 'true';
+
+const GEN_ASS_ENGINE     = process.env.GEN_ASS_ENGINE    || 'n8n';
+const GEN_ASS_URL        = process.env.GEN_ASS_URL       || '';        // si está vacío, no se llama
+const GEN_ASS_AUTH       = process.env.GEN_ASS_AUTH      || '';
+const GEN_ASS_NAME       = process.env.GEN_ASS_NAME      || 'BOT';
+const GEN_ASS_INTERVAL   = Number(process.env.GEN_ASS_INTERVAL   || 10);    // segundos
+const GEN_ASS_TAIL_CHARS = Number(process.env.GEN_ASS_TAIL_CHARS || 2000);  // 0 = sin tail
+const GEN_ASS_MIN_CHARS  = Number(process.env.GEN_ASS_MIN_CHARS  || 120);
 
 if (!DG_KEY) {
   console.error('[DG-GW] ❌ Missing DEEPGRAM_API_KEY');
@@ -74,6 +98,29 @@ const cZeroPcmFrames = new prom.Counter({
   registers: [register]
 });
 
+// ==================================================================
+// GEN-ASSISTANT: métricas específicas
+// ==================================================================
+const gGenAssConversations = new prom.Gauge({
+  name: 'dg_gen_assistant_conversations_active',
+  help: 'Conversations tracked for generative assistant',
+  registers: [register]
+});
+
+const cGenAssRequests = new prom.Counter({
+  name: 'dg_gen_assistant_requests_total',
+  help: 'Requests sent to generative assistant engine',
+  labelNames: ['engine'],
+  registers: [register]
+});
+
+const cGenAssErrors = new prom.Counter({
+  name: 'dg_gen_assistant_errors_total',
+  help: 'Errors calling generative assistant engine',
+  labelNames: ['engine', 'type'],
+  registers: [register]
+});
+
 // =======================================================
 // Web + Socket.IO (widget)
 // =======================================================
@@ -109,6 +156,75 @@ const ctxByUuid = new Map();
 // pending per dir, to bind next SSRC on that dir to uuid
 const pendingByDir = { in: [], out: [] };
 const PENDING_TTL_MS = 4000;
+
+// ==================================================================
+// GEN-ASSISTANT: memoria en proceso por llamada
+//  - Solo se usa si GENERATIVE_ASSISTANT === true
+//  - Estructura básica: uuid -> { items: [...], totalChars, lastActivity }
+//  - items que se mandan a N8N: { ts, speaker: "user"|"agent", text }
+// ==================================================================
+const convByUuid = new Map();
+
+// Devuelve la etiqueta que verá el agente en el widget
+function widgetSpeakerLabel(sess) {
+  const dir = sess?.dir;
+  const callerLabel = sess?.callername || sess?.caller || 'Caller';
+  const agentLabel  = sess?.exten || 'Agent';
+
+  if (DG_ROLE_MODE === 'AGENT_IN') {
+    // "in" = agente, "out" = cliente
+    return (dir === 'in') ? agentLabel : callerLabel;
+  }
+
+  // Modo por defecto: "CALLER_IN" => "in" = cliente, "out" = agente
+  return (dir === 'in') ? callerLabel : agentLabel;
+}
+
+// Devuelve el rol lógico para el LLM: "user"/"agent"
+function llmRoleForDir(dir) {
+  if (DG_ROLE_MODE === 'AGENT_IN') {
+    // Si "in" es el agente:
+    //  - dir=in  => agent
+    //  - dir=out => user (cliente)
+    return (dir === 'in') ? 'agent' : 'user';
+  }
+
+  // Modo por defecto: "CALLER_IN"
+  //  - dir=in  => user (cliente)
+  //  - dir=out => agent
+  return (dir === 'in') ? 'user' : 'agent';
+}
+
+function genAssEnsureConv(uuid) {
+  let conv = convByUuid.get(uuid);
+  if (!conv) {
+    conv = { items: [], totalChars: 0, lastActivity: Date.now(), lastSentItems: 0 };
+    convByUuid.set(uuid, conv);
+    gGenAssConversations.set(convByUuid.size);
+  }
+  return conv;
+}
+
+function genAssAddFinalSegment(uuid, dir, text) {
+  if (!GENERATIVE_ASSISTANT) return;
+  if (!text) return;
+
+  const conv = genAssEnsureConv(uuid);
+
+  // rol lógico para el LLM, según DG_ROLE_MODE
+  const speaker = llmRoleForDir(dir);
+  const ts = Date.now() / 1000; // epoch seconds
+
+  conv.items.push({ ts, speaker, text });
+  conv.totalChars += text.length;
+  conv.lastActivity = Date.now();
+}
+
+function genAssCleanupConversation(uuid) {
+  if (!convByUuid.has(uuid)) return;
+  convByUuid.delete(uuid);
+  gGenAssConversations.set(convByUuid.size);
+}
 
 function pushPending(dir, uuid) {
   if (!(dir === 'in' || dir === 'out')) return;
@@ -149,18 +265,36 @@ app.get('/register', (req, res) => {
 
   if (dir === 'in' || dir === 'out') pushPending(dir, uuid);
 
-  // Emit call-start so widget can auto-clear on new call
+  // Calculamos "from" y "to" lógicos según el modo:
+  // - CALLER_IN  => from = cliente (caller), to = agente (exten)
+  // - AGENT_IN   => from = agente (exten),  to = cliente (caller)
+  const agent  = ctx.exten;
+  const client = ctx.caller || ctx.callername || '';
+  let from = client;
+  let to   = agent;
+
+  if (DG_ROLE_MODE === 'AGENT_IN') {
+    from = agent;
+    to   = client;
+  }
+
+  // Emit call-start para que el widget pueda pintar cabecera
   if (isNew || req.query.force_start === '1') {
     io.to(ctx.exten).emit('call-start', {
       uuid,
       exten: ctx.exten,
       caller: ctx.caller,
       callername: ctx.callername,
+      from,
+      to,
       ts: Date.now()
     });
   }
 
-  console.log(`[DG-GW] register uuid=${uuid} exten=${ctx.exten} caller=${ctx.caller} dir=${dir}`);
+  console.log(
+    `[DG-GW] register uuid=${uuid} exten=${ctx.exten} caller=${ctx.caller} ` +
+    `dir=${dir} from=${from} to=${to}`
+  );
   res.send('OK');
 });
 
@@ -170,6 +304,12 @@ app.get('/unregister', (req, res) => {
     ctxByUuid.delete(uuid);
     console.log(`[DG-GW] unregister uuid=${uuid}`);
   }
+
+  // GEN-ASSISTANT: limpieza de memoria de conversación si existía
+  if (uuid && GENERATIVE_ASSISTANT) {
+    genAssCleanupConversation(uuid);
+  }
+
   res.send('OK');
 });
 
@@ -220,21 +360,41 @@ function dgConnect(sampleRate = 16000, lang = DG_LANG) {
       const text = alt.transcript || '';
       if (!text) return;
 
-      const speaker =
-        (s?.dir === 'in')
-          ? (s.callername || s.caller || 'Caller')
-          : (s?.exten || 'Agent');
+      // GEN-ASSISTANT: almacenar solo segmentos finales en memoria de conversación
+      if (GENERATIVE_ASSISTANT && s?.uuid && msg.is_final) {
+        genAssAddFinalSegment(s.uuid, s.dir, text);
+      }
 
-      io.to(s.room).emit('stt', {
-        text,
-        isFinal: !!msg.is_final,
-        words: alt.words || [],
-        uuid: s.uuid,
-        dir: s.dir,
-        speaker,
-        exten: s.exten,
-        caller: s.caller || s.callername || ''
-      });
+      // speaker que se muestra en el widget (número/extensión),
+      // calculado según DG_ROLE_MODE
+      const speaker = widgetSpeakerLabel(s);
+
+      // DEBUG: loguear quién está “hablando” según el gateway
+      if (msg.is_final) {
+        console.log(
+          '[STT-FINAL]',
+          'uuid=', s.uuid,
+          'dir=', s.dir,
+          'exten=', s.exten,
+          'caller=', s.caller,
+          'speaker=', speaker,
+          'text=', JSON.stringify(text)
+        );
+      }
+
+      // SHOW_TRANSCRIPTION controla si enviamos STT al widget
+      if (SHOW_TRANSCRIPTION) {
+        io.to(s.room).emit('stt', {
+          text,
+          isFinal: !!msg.is_final,
+          words: alt.words || [],
+          uuid: s.uuid,
+          dir: s.dir,
+          speaker,
+          exten: s.exten,
+          caller: s.caller || s.callername || ''
+        });
+      }
     }
   });
 
@@ -363,6 +523,14 @@ function startWatchdog(sess) {
       clearInterval(sess.timer);
       rtpSessions.delete(sess.ssrc);
       gSessions.set(rtpSessions.size);
+
+      // GEN-ASSISTANT: si esta era la última sesión de ese uuid, limpiamos memoria
+      if (GENERATIVE_ASSISTANT && sess.uuid) {
+        const stillHas = Array.from(rtpSessions.values()).some(s => s.uuid === sess.uuid);
+        if (!stillHas) {
+          genAssCleanupConversation(sess.uuid);
+        }
+      }
     }
   }, 2000);
 }
@@ -433,8 +601,8 @@ function onRtpMessage(dir) {
 
     let pcm = Buffer.from(payload);
     if (isAllZero16(pcm)) {
-	    sess.zeros++;
-	    cZeroPcmFrames.inc({ dir });
+      sess.zeros++;
+      cZeroPcmFrames.inc({ dir });
     }
     pcm = maybeSwapEndian(pcm);
 
@@ -470,3 +638,145 @@ rtpSockOut.bind(RTP_PORT_OUT, '0.0.0.0', () => {
   const a = rtpSockOut.address();
   console.log(`[DG-GW] RTP OUT listening on ${a.address}:${a.port} (slin16 ${SWAP_ENDIAN?'swap':'LE'})`);
 });
+
+// ==================================================================
+// GEN-ASSISTANT: ciclo periódico hacia N8N (u otro motor)
+//  - Desactivado si GENERATIVE_ASSISTANT === false o GEN_ASS_URL vacío
+//  - No rompe el comportamiento actual (solo añade capacidad extra)
+// ==================================================================
+
+function postJson(urlStr, headers, payload) {
+  return new Promise((resolve, reject) => {
+    try {
+      const u = new URL(urlStr);
+      const body = Buffer.from(JSON.stringify(payload));
+      const opts = {
+        protocol: u.protocol,
+        hostname: u.hostname,
+        port: u.port || (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname + (u.search || ''),
+        method: 'POST',
+        headers: Object.assign(
+          {
+            'Content-Type': 'application/json',
+            'Content-Length': body.length
+          },
+          headers || {}
+        )
+      };
+
+      const req = (u.protocol === 'https:' ? https : http).request(opts, (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          const buf = Buffer.concat(chunks);
+          if (!buf.length) return resolve(null);
+          try {
+            const json = JSON.parse(buf.toString('utf8'));
+            resolve(json);
+          } catch (e) {
+            reject(e);
+          }
+        });
+      });
+
+      req.on('error', reject);
+      req.write(body);
+      req.end();
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+async function runGenAssistantCycle() {
+  if (!GENERATIVE_ASSISTANT) return;
+  if (!GEN_ASS_URL) return;
+
+  for (const [uuid, conv] of convByUuid.entries()) {
+    if (!conv.items.length) continue;
+
+    if (conv.totalChars < GEN_ASS_MIN_CHARS) continue;
+
+    if (conv.lastSentItems && conv.items.length === conv.lastSentItems) {
+      continue;
+    }
+
+    // Construir ventana TAIL si aplica
+    let items = conv.items;
+    if (GEN_ASS_TAIL_CHARS > 0) {
+      let acc = 0;
+      const picked = [];
+      for (let i = items.length - 1; i >= 0; i--) {
+        const it = items[i];
+        acc += (it.text || '').length;
+        picked.push(it);
+        if (acc >= GEN_ASS_TAIL_CHARS) break;
+      }
+      items = picked.reverse();
+    }
+
+    const payload = {
+      call_id: uuid,
+      conversation: items.map(it => ({
+        ts: it.ts,
+        speaker: it.speaker,
+        text: it.text
+      }))
+    };
+
+    try {
+      cGenAssRequests.inc({ engine: GEN_ASS_ENGINE });
+
+      const headers = {};
+      if (GEN_ASS_AUTH) headers['Authorization'] = GEN_ASS_AUTH;
+
+      const body = await postJson(GEN_ASS_URL, headers, payload);
+      if (!body || !body.assistant) {
+        cGenAssErrors.inc({ engine: GEN_ASS_ENGINE, type: 'parse' });
+        continue;
+      }
+
+      const assistant = body.assistant || {};
+      if (assistant.visibility === 'agent' && typeof assistant.text === 'string' && assistant.text.trim()) {
+        const text = assistant.text.trim();
+        const name = GEN_ASS_NAME || 'BOT';
+
+        const ctx = ctxByUuid.get(uuid);
+        const room = ctx?.exten || 'mix';
+
+        io.to(room).emit('assist', {
+          text,
+          speaker: name
+        });
+	
+	// 👇 NUEVO: añadimos también el mensaje del BOT a la memoria
+        const conv = genAssEnsureConv(uuid);
+        const ts = Date.now() / 1000;
+
+        conv.items.push({
+          ts,
+          speaker: 'assistant',  // nuevo rol lógico
+          text
+        });
+        // Opcional: no sumamos a totalChars para no inflar el umbral mínimo
+        // conv.totalChars += text.length;
+
+        conv.lastActivity = Date.now();
+
+      } else {
+        cGenAssErrors.inc({ engine: GEN_ASS_ENGINE, type: 'no_text' });
+      }
+    } catch (err) {
+      console.error('[GEN-ASSISTANT] error:', err?.message || err);
+      cGenAssErrors.inc({ engine: GEN_ASS_ENGINE, type: 'network' });
+    } finally {
+	conv.lastSentItems = conv.items.length;
+    }
+  }
+}
+
+if (GENERATIVE_ASSISTANT && GEN_ASS_INTERVAL > 0) {
+  setInterval(runGenAssistantCycle, GEN_ASS_INTERVAL * 1000);
+  console.log(`[GEN-ASSISTANT] enabled: engine=${GEN_ASS_ENGINE} interval=${GEN_ASS_INTERVAL}s`);
+}

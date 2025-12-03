@@ -1,8 +1,14 @@
-// mti-gw.js (OPCIÓN 2 DEFINITIVA)
+// mti-gw.js (OPCIÓN 2 DEFINITIVA + START JSON EXTENDIDO)
 //  - Recibe RTP SLIN16 en PUERTOS DINÁMICOS por llamada.
-//  - Cada llamada se registra vía HTTP /register (uuid, port).
+//  - Cada llamada se registra vía HTTP /register (uuid, port, agent_*).
 //  - 1 puerto UDP = 1 sesión = 1 socket TCP hacia MTI.
-//  - START frame incluye el UNIQUEID real.
+//  - START frame (TYPE 0x01) incluye JSON UTF-8:
+//      {
+//        "call_uuid": "…",
+//        "agent_extension": "…",
+//        "agent_username": "…",
+//        "agent_id": "…"
+//      }
 
 const dgram = require('dgram');
 const net   = require('net');
@@ -116,7 +122,11 @@ function buildFrame(type, payloadBuf) {
   return buf;
 }
 
-// sessionsByPort[port] = { port, uuid, udpSock, tcpSock, connected, queue, audioBuffer, lastRtpMs, ended, timer }
+// sessionsByPort[port] = {
+//   port, uuid,
+//   agentExtension, agentUsername, agentId,
+//   udpSock, tcpSock, connected, queue, audioBuffer, lastRtpMs, ended, inactivityTimer
+// }
 const sessionsByPort = new Map();
 
 function updateSessionGauges() {
@@ -125,10 +135,14 @@ function updateSessionGauges() {
   gPortsInUse.set(size);
 }
 
-function createSession(port, uuid) {
+function createSession(port, uuid, meta) {
   if (sessionsByPort.has(port)) {
     throw new Error(`Port already registered: ${port}`);
   }
+
+  const agentExtension = (meta && meta.agentExtension) || '';
+  const agentUsername  = (meta && meta.agentUsername)  || '';
+  const agentId        = (meta && meta.agentId)        || '';
 
   const udpSock = dgram.createSocket('udp4');
   const tcpSock = new net.Socket();
@@ -136,6 +150,9 @@ function createSession(port, uuid) {
   const sess = {
     port,
     uuid,
+    agentExtension,
+    agentUsername,
+    agentId,
     udpSock,
     tcpSock,
     connected: false,
@@ -152,9 +169,20 @@ function createSession(port, uuid) {
 
   // TCP events
   tcpSock.on('connect', () => {
-    console.log(`[MTI-GW] TCP connected to ${MTI_HOST}:${MTI_PORT} port=${port} uuid=${uuid}`);
+    console.log(
+      `[MTI-GW] TCP connected to ${MTI_HOST}:${MTI_PORT} port=${port} uuid=${uuid} ` +
+      `agent_extension=${agentExtension} agent_username=${agentUsername} agent_id=${agentId}`
+    );
 
-    const payload = Buffer.from(uuid, 'utf8');
+    // START frame JSON UTF-8 según especificación del cliente
+    const startPayloadObj = {
+      call_uuid:        uuid || '',
+      agent_extension:  agentExtension || '',
+      agent_username:   agentUsername || '',
+      agent_id:         agentId || ''
+    };
+    const payload = Buffer.from(JSON.stringify(startPayloadObj), 'utf8');
+
     tcpSock.write(buildFrame(0x01, payload));
     console.log(`[MTI-GW] Sent START (0x01 len=${payload.length}) port=${port} uuid=${uuid}`);
 
@@ -167,15 +195,15 @@ function createSession(port, uuid) {
     }
 
     if (!sess.inactivityTimer) {
-    sess.inactivityTimer = setInterval(() => {
-      const now = Date.now();
-      if (!sess.ended && now - sess.lastRtpMs > INACTIVITY_MS) {
-        console.log(`[MTI-GW] Inactivity timeout port=${port} uuid=${uuid}`);
-        cInactivityTimeouts.inc();                    // <<< nuevo
-        sendEndAndClose(sess, 'inactivity');
-      }
-    }, 2000);
-   }
+      sess.inactivityTimer = setInterval(() => {
+        const now = Date.now();
+        if (!sess.ended && now - sess.lastRtpMs > INACTIVITY_MS) {
+          console.log(`[MTI-GW] Inactivity timeout port=${port} uuid=${uuid}`);
+          cInactivityTimeouts.inc();
+          sendEndAndClose(sess, 'inactivity');
+        }
+      }, 2000);
+    }
   });
 
   tcpSock.on('error', (err) => {
@@ -281,6 +309,11 @@ const httpServer = http.createServer(async (req, res) => {
     const uuid = parsed.query.uuid;
     const port = Number(parsed.query.port);
 
+    // Metadatos de agente, strings opacos según especificación del cliente
+    const agentExtension = parsed.query.agent_extension || '';
+    const agentUsername  = parsed.query.agent_username  || '';
+    const agentId        = parsed.query.agent_id        || '';
+
     if (!uuid || !port) {
       res.statusCode = 400;
       cHttpErrors.inc({ path: '/register', code: '400' });
@@ -288,8 +321,15 @@ const httpServer = http.createServer(async (req, res) => {
     }
 
     try {
-      createSession(port, uuid);
-      console.log(`[MTI-GW] Registered port=${port} uuid=${uuid}`);
+      createSession(port, uuid, {
+        agentExtension,
+        agentUsername,
+        agentId
+      });
+      console.log(
+        `[MTI-GW] Registered port=${port} uuid=${uuid} ` +
+        `agent_extension=${agentExtension} agent_username=${agentUsername} agent_id=${agentId}`
+      );
       cHttpRegister.inc();
       res.statusCode = 200; return res.end('OK');
     } catch (e) {

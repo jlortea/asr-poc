@@ -38,6 +38,12 @@
       background: rgba(60, 220, 140, 0.16);
     }
 
+    /* GEN-ASSISTANT: estilo ligero para las sugerencias del BOT */
+    .bot {
+      background: rgba(255, 255, 255, 0.06);
+      font-style: italic;
+    }
+
     .meta {
       font-weight: 600;
       margin-right: 6px;
@@ -67,7 +73,7 @@
     const params = new URLSearchParams(location.search);
     const exten = params.get('exten') || 'mix';
 
-    // retrocompat: server usa query.uuid como room
+    // retrocompat: el servidor usa query.uuid como nombre de sala (normalmente la extensión del agente)
     const socket = io({ query: { uuid: exten } });
     const live = document.getElementById('live');
 
@@ -88,7 +94,7 @@
 
     function addLine({ text, cls, speaker, type }) {
       const div = document.createElement('div');
-      div.className = `line ${cls} ${type || ''}`;
+      div.className = `line ${cls} ${type || ''}`.trim();
 
       const t = document.createElement('span');
       t.className = 'time';
@@ -119,21 +125,44 @@
       return div;
     }
 
-    socket.on('call-start', ({ uuid, caller, callername }) => {
-      if (uuid && uuid !== currentUuid) {
-        clearLive();
-        currentUuid = uuid;
-        const who = callername || caller || 'Caller';
-        addSys(`Nueva llamada: ${who} → ${exten}`);
-      }
+    // Inicio de llamada (limpia pantalla y muestra cabecera)
+    socket.on('call-start', ({ uuid, caller, callername, from, to }) => {
+  	if (uuid && uuid !== currentUuid) {
+	    	clearLive();
+    		currentUuid = uuid;
+
+	    	let headerText;
+    		if (from && to) {
+	      	// Nuevo formato: el servidor ya nos dice origen/destino lógicos
+      			headerText = `Nueva llamada: ${from} → ${to}`;
+	    	} else {
+      			// Retrocompatibilidad: antiguo comportamiento
+	      		const who = callername || caller || 'Caller';
+	      		headerText = `Nueva llamada: ${who} → ${exten}`;
+   		}
+
+	    	addSys(headerText);
+  	}
     });
 
-    socket.on('stt', ({ text, isFinal, speaker, dir }) => {
+
+    // Transcripción STT (Deepgram)
+    socket.on('stt', ({ text, isFinal, speaker, dir, exten, caller }) => {
       if (!text) return;
 
-      const type = (dir === 'in') ? 'caller'
-                  : (dir === 'out') ? 'agent'
-                  : null;
+      let type = null;
+
+      // Intentamos identificar el rol comparando speaker con los metadatos
+      if (speaker && caller && speaker === caller) {
+        type = 'caller';   // lado cliente
+      } else if (speaker && exten && speaker === exten) {
+        type = 'agent';    // lado agente
+      } else {
+        // Fallback: si por lo que sea no coincide, usamos dir para mantener compatibilidad
+        type = (dir === 'in') ? 'caller'
+             : (dir === 'out') ? 'agent'
+             : null;
+      }
 
       if (isFinal) {
         if (lastPartial) { lastPartial.remove(); lastPartial = null; }
@@ -158,6 +187,18 @@
       }
     });
 
+    // GEN-ASSISTANT: mensajes de ayuda del BOT (evento "assist")
+    socket.on('assist', ({ text, speaker }) => {
+      if (!text) return;
+      addLine({
+        text,
+        cls: 'final',
+        speaker: speaker || 'BOT',
+        type: 'bot'
+      });
+    });
+
+    // Fin de transcripción (opcional)
     socket.on('stt-end', () => {
       addSys('fin de transcripción');
     });
