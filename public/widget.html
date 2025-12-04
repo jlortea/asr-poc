@@ -3,86 +3,392 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
+
   <style>
+    :root {
+      --orange: #f68608;
+      --bg-page: #f3f4f6;
+      --bg-header: #ffffff;
+      --bg-agent: #fff3e3;
+      --bg-user: #f7f7f9;
+      --bg-bot: #ffffff;
+      --bg-system: #eceff3;
+      --text-main: #111827;
+      --text-muted: #6b7280;
+      --border-soft: rgba(15,23,42,0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
     body {
-      font: 14px system-ui, sans-serif;
-      margin: 8px;
-      background: #0b0c0f;
-      color: #e8e8ea;
+      margin: 0;
+      font: 14px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg-page);
+      color: var(--text-main);
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+
+    /* HEADER -------------------------------------------------- */
+
+    .header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 16px;
+      background: var(--bg-header);
+      box-shadow: 0 1px 0 rgba(15,23,42,0.06);
+    }
+
+    .header-left {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      font-size: 13px;
+    }
+
+    .header-title {
+      font-weight: 600;
+    }
+
+    .header-exten {
+      font-size: 12px;
+      padding: 2px 6px;
+      border-radius: 999px;
+      background: rgba(246,134,8,0.09);
+      color: var(--orange);
+      border: 1px solid rgba(246,134,8,0.3);
+    }
+
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .toggle-group {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .toggle input {
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .toggle-switch {
+      width: 32px;
+      height: 16px;
+      border-radius: 999px;
+      background: #d1d5db;
+      position: relative;
+      flex-shrink: 0;
+      transition: background 0.18s ease;
+    }
+
+    .toggle-thumb {
+      width: 14px;
+      height: 14px;
+      border-radius: 999px;
+      background: #ffffff;
+      position: absolute;
+      top: 1px;
+      left: 1px;
+      box-shadow: 0 1px 3px rgba(15,23,42,0.25);
+      transition: transform 0.18s ease;
+    }
+
+    .toggle input:checked + .toggle-switch {
+      background: rgba(246,134,8,0.55);
+    }
+
+    .toggle input:checked + .toggle-switch .toggle-thumb {
+      transform: translateX(16px);
+    }
+
+    .toggle span.label {
+      font-size: 11px;
+    }
+
+    .reload-btn {
+      border: none;
+      background: transparent;
+      cursor: pointer;
+      padding: 4px;
+      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.15s ease, transform 0.1s ease;
+      color: var(--text-muted);
+    }
+
+    .reload-btn:hover {
+      background: rgba(15,23,42,0.06);
+    }
+
+    .reload-btn:active {
+      transform: scale(0.95);
+    }
+
+    .reload-btn svg {
+      width: 20px;
+      height: 20px;
+    }
+
+    /* MAIN / CHAT --------------------------------------------- */
+
+    .main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
     }
 
     #live {
-      white-space: pre-wrap;
-      line-height: 1.45;
-      max-height: 95vh;
-      overflow-y: auto;
+      flex: 1;
+      padding: 16px 12px 32px;
       display: flex;
       flex-direction: column;
-      gap: 6px;
+      gap: 8px;
+      overflow-y: auto;
     }
 
     .line {
-      padding: 6px 8px;
-      border-radius: 8px;
-      box-shadow: 0 0 0 1px rgba(255,255,255,0.04) inset;
+      display: flex;
+      width: 100%;
     }
 
-    .final { opacity: .98; }
-    .partial { opacity: .65; }
-
-    /* 🎨 Fondo por interlocutor */
-    .caller {
-      background: rgba(60, 120, 255, 0.18);
-    }
-    .agent {
-      background: rgba(60, 220, 140, 0.16);
+    .line-caller {
+      justify-content: flex-start;
     }
 
-    /* GEN-ASSISTANT: estilo ligero para las sugerencias del BOT */
-    .bot {
-      background: rgba(255, 255, 255, 0.06);
+    .line-agent {
+      justify-content: flex-end;
+    }
+
+    .line-bot,
+    .line-neutral,
+    .line-system {
+      justify-content: center;
+    }
+
+    .bubble {
+      max-width: 70%;
+      min-width: 120px;
+      padding: 6px 10px;
+      border-radius: 12px;
+      box-shadow: 0 0 0 1px var(--border-soft);
+      background: #ffffff;
+      font-size: 13px;
+      display: inline-flex;
+      flex-direction: column;
+      gap: 2px;
+      word-wrap: break-word;
+      white-space: pre-wrap;
+    }
+
+    @media (max-width: 768px) {
+      .bubble {
+        max-width: 88%;
+      }
+    }
+
+    .bubble-meta {
+      font-size: 11px;
+      color: var(--text-muted);
+      display: flex;
+      gap: 4px;
+    }
+
+    .bubble-text {
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .bubble.partial {
+      opacity: 0.65;
+    }
+
+    /* Caller (cliente) */
+    .bubble-caller {
+      background: var(--bg-user);
+    }
+
+    /* Agent */
+    .bubble-agent {
+      background: var(--bg-agent);
+    }
+
+    /* BOT */
+    .bubble-bot {
+      background: var(--bg-bot);
+      border: 1px solid rgba(246,134,8,0.7);
+      box-shadow: 0 0 0 1px rgba(246,134,8,0.25);
       font-style: italic;
     }
 
-    .meta {
+    .bubble-bot .bubble-meta {
+      color: var(--orange);
       font-weight: 600;
-      margin-right: 6px;
-      opacity: .95;
     }
 
-    .time {
-      font-variant-numeric: tabular-nums;
-      opacity: .75;
-      margin-right: 6px;
+    /* System messages */
+    .system {
+      max-width: 80%;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--bg-system);
+      font-size: 11px;
+      color: var(--text-muted);
+      text-align: center;
     }
 
-    .sys {
-      background: rgba(255,255,255,0.06);
-      opacity: .8;
-      font-style: italic;
-      padding: 6px 8px;
-      border-radius: 8px;
+    /* FOOTER -------------------------------------------------- */
+
+    .footer {
+      padding: 6px 12px 12px;
+      font-size: 11px;
+      text-align: center;
+      color: var(--text-muted);
+    }
+
+    .footer a {
+      color: var(--orange);
+      text-decoration: none;
+      font-weight: 500;
+    }
+
+    .footer a:hover {
+      text-decoration: underline;
     }
   </style>
 </head>
 <body>
-  <div id="live"></div>
+  <div class="header">
+    <div class="header-left">
+      <span class="header-title">Deitu Call Assistant</span>
+      <span id="header-exten" class="header-exten"></span>
+    </div>
+    <div class="header-right">
+      <div class="toggle-group">
+        <label class="toggle">
+          <input id="toggle-stt" type="checkbox" checked />
+          <span class="toggle-switch"><span class="toggle-thumb"></span></span>
+          <span class="label">Transcribed conversation</span>
+        </label>
+        <label class="toggle">
+          <input id="toggle-assist" type="checkbox" checked />
+          <span class="toggle-switch"><span class="toggle-thumb"></span></span>
+          <span class="label">Generative assistant</span>
+        </label>
+      </div>
+      <button class="reload-btn" title="Reload">
+        <!-- SVG EXACTO QUE ME HAS PASADO -->
+        <svg xmlns="http://www.w3.org/2000/svg"
+             class="icon icon-tabler icon-tabler-refresh"
+             width="24" height="24" viewBox="0 0 24 24"
+             stroke-width="2" fill="none"
+             stroke-linecap="round" stroke-linejoin="round" stroke="#f68608">
+          <path stroke="none" d="M0 0h24v24H0z" fill="none"></path>
+          <path d="M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4"></path>
+          <path d="M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4"></path>
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <div class="main">
+    <div id="live"></div>
+  </div>
+
+  <div class="footer">
+    Developed by <a href="https://www.irontec.com" target="_blank" rel="noreferrer">Irontec</a>
+  </div>
 
   <script src="/socket.io/socket.io.js"></script>
   <script>
     const params = new URLSearchParams(location.search);
     const exten = params.get('exten') || 'mix';
 
-    // retrocompat: el servidor usa query.uuid como nombre de sala (normalmente la extensión del agente)
+    document.getElementById('header-exten').textContent = `Ext. ${exten}`;
+
     const socket = io({ query: { uuid: exten } });
     const live = document.getElementById('live');
+
+    const toggleSttEl = document.getElementById('toggle-stt');
+    const toggleAssistEl = document.getElementById('toggle-assist');
+    const reloadBtn = document.querySelector('.reload-btn');
+
+    let transcribedConversationEnabled = true;
+    let generativeAssistantEnabled = true;
+
+    function scrollToBottom() {
+      // Forzar scroll al último elemento y al final del contenedor
+      requestAnimationFrame(() => {
+        const last = live.lastElementChild;
+        if (last && typeof last.scrollIntoView === 'function') {
+          last.scrollIntoView({ block: 'end', inline: 'nearest' });
+        }
+        live.scrollTop = live.scrollHeight;
+      });
+    }
+
+    function applyVisibility(line) {
+      const kind = line.dataset.kind || 'stt';
+      if (kind === 'stt') {
+        line.style.display = transcribedConversationEnabled ? '' : 'none';
+      } else if (kind === 'assist') {
+        line.style.display = generativeAssistantEnabled ? '' : 'none';
+      } else {
+        line.style.display = '';
+      }
+    }
+
+    function updateVisibility() {
+      Array.from(live.children).forEach(applyVisibility);
+      scrollToBottom();
+    }
+
+    toggleSttEl.addEventListener('change', () => {
+      transcribedConversationEnabled = toggleSttEl.checked;
+      updateVisibility();
+    });
+
+    toggleAssistEl.addEventListener('change', () => {
+      generativeAssistantEnabled = toggleAssistEl.checked;
+      updateVisibility();
+    });
+
+    reloadBtn.addEventListener('click', () => {
+      location.reload();
+    });
 
     let currentUuid = null;
     let lastPartial = null;
     let lastPartialSpeaker = null;
 
     function nowTime() {
-      // HH:MM:SS 24h
       return new Date().toLocaleTimeString('es-ES', { hour12: false });
     }
 
@@ -90,115 +396,121 @@
       live.innerHTML = '';
       lastPartial = null;
       lastPartialSpeaker = null;
+      scrollToBottom();
     }
 
-    function addLine({ text, cls, speaker, type }) {
-      const div = document.createElement('div');
-      div.className = `line ${cls} ${type || ''}`.trim();
+    function addLine({ text, cls, speaker, type, kind }) {
+      const line = document.createElement('div');
+      line.className = `line line-${type || 'neutral'}`;
+      line.dataset.kind = kind || 'stt';
 
-      const t = document.createElement('span');
-      t.className = 'time';
-      t.textContent = `[${nowTime()}]`;
+      const bubble = document.createElement('div');
+      bubble.className = `bubble ${cls || ''} bubble-${type || 'neutral'}`.trim();
 
-      const m = document.createElement('span');
-      m.className = 'meta';
-      m.textContent = speaker ? `[${speaker}]` : '';
+      const meta = document.createElement('div');
+      meta.className = 'bubble-meta';
 
-      const x = document.createElement('span');
-      x.textContent = text;
+      const timeSpan = document.createElement('span');
+      timeSpan.textContent = `[${nowTime()}]`;
 
-      div.appendChild(t);
-      if (speaker) div.appendChild(m);
-      div.appendChild(x);
+      const speakerSpan = document.createElement('span');
+      speakerSpan.textContent = speaker ? `[${speaker}]` : '';
 
-      live.appendChild(div);
-      live.scrollTop = live.scrollHeight;
-      return div;
+      meta.appendChild(timeSpan);
+      if (speaker) meta.appendChild(speakerSpan);
+
+      const textSpan = document.createElement('div');
+      textSpan.className = 'bubble-text';
+      textSpan.textContent = text;
+
+      bubble.appendChild(meta);
+      bubble.appendChild(textSpan);
+
+      line.appendChild(bubble);
+      live.appendChild(line);
+
+      applyVisibility(line);
+      scrollToBottom();
+
+      return line;
     }
 
     function addSys(text) {
+      const line = document.createElement('div');
+      line.className = 'line line-system';
+      line.dataset.kind = 'system';
+
       const div = document.createElement('div');
-      div.className = 'sys';
+      div.className = 'system';
       div.textContent = `[${nowTime()}] ${text}`;
-      live.appendChild(div);
-      live.scrollTop = live.scrollHeight;
+
+      line.appendChild(div);
+      live.appendChild(line);
+      scrollToBottom();
       return div;
     }
 
-    // Inicio de llamada (limpia pantalla y muestra cabecera)
+    // Inicio de llamada
     socket.on('call-start', ({ uuid, caller, callername, from, to }) => {
-  	if (uuid && uuid !== currentUuid) {
-	    	clearLive();
-    		currentUuid = uuid;
+      if (uuid && uuid !== currentUuid) {
+        clearLive();
+        currentUuid = uuid;
 
-	    	let headerText;
-    		if (from && to) {
-	      	// Nuevo formato: el servidor ya nos dice origen/destino lógicos
-      			headerText = `Nueva llamada: ${from} → ${to}`;
-	    	} else {
-      			// Retrocompatibilidad: antiguo comportamiento
-	      		const who = callername || caller || 'Caller';
-	      		headerText = `Nueva llamada: ${who} → ${exten}`;
-   		}
-
-	    	addSys(headerText);
-  	}
+        let headerText;
+        if (from && to) {
+          headerText = `Nueva llamada: ${from} → ${to}`;
+        } else {
+          const who = callername || caller || 'Caller';
+          headerText = `Nueva llamada: ${who} → ${exten}`;
+        }
+        addSys(headerText);
+      }
     });
 
-
-    // Transcripción STT (Deepgram)
-    socket.on('stt', ({ text, isFinal, speaker, dir, exten, caller }) => {
+    // Transcripción STT
+    socket.on('stt', ({ text, isFinal, speaker, dir, exten: extenMeta, caller }) => {
       if (!text) return;
 
       let type = null;
-
-      // Intentamos identificar el rol comparando speaker con los metadatos
       if (speaker && caller && speaker === caller) {
-        type = 'caller';   // lado cliente
-      } else if (speaker && exten && speaker === exten) {
-        type = 'agent';    // lado agente
+        type = 'caller';
+      } else if (speaker && extenMeta && speaker === extenMeta) {
+        type = 'agent';
       } else {
-        // Fallback: si por lo que sea no coincide, usamos dir para mantener compatibilidad
         type = (dir === 'in') ? 'caller'
              : (dir === 'out') ? 'agent'
-             : null;
+             : 'neutral';
       }
 
       if (isFinal) {
         if (lastPartial) { lastPartial.remove(); lastPartial = null; }
-        addLine({ text, cls: 'final', speaker, type });
+        addLine({ text, cls: 'final', speaker, type, kind: 'stt' });
         lastPartialSpeaker = null;
       } else {
         if (!lastPartial || lastPartialSpeaker !== speaker) {
           if (lastPartial) lastPartial.remove();
-          lastPartial = addLine({ text, cls: 'partial', speaker, type });
+          lastPartial = addLine({ text, cls: 'partial', speaker, type, kind: 'stt' });
           lastPartialSpeaker = speaker;
         } else {
-          // actualiza parcial existente manteniendo timestamp original visualmente
-          const spans = lastPartial.querySelectorAll('span');
-          const timeSpan = spans[0];
-          const metaSpan = spans[1];
-          const textSpan = spans[2] || spans[1];
-
-          if (metaSpan && speaker) metaSpan.textContent = `[${speaker}]`;
-          textSpan.textContent = text;
+          const textSpan = lastPartial.querySelector('.bubble-text');
+          if (textSpan) textSpan.textContent = text;
+          scrollToBottom();
         }
-        live.scrollTop = live.scrollHeight;
       }
     });
 
-    // GEN-ASSISTANT: mensajes de ayuda del BOT (evento "assist")
+    // Mensajes del asistente generativo
     socket.on('assist', ({ text, speaker }) => {
       if (!text) return;
       addLine({
         text,
         cls: 'final',
         speaker: speaker || 'BOT',
-        type: 'bot'
+        type: 'bot',
+        kind: 'assist'
       });
     });
 
-    // Fin de transcripción (opcional)
     socket.on('stt-end', () => {
       addSys('fin de transcripción');
     });
