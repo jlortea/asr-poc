@@ -94,11 +94,69 @@ Steps:
     -   Frames SLIN16 as START (0x01), AUDIO (0x12), END (0x00)
         
     -   Sends it to MTI via TCP
-        
+       
+
+### New START frame payload (JSON UTF-8):
+```text
+{
+  "call_uuid": "<asterisk-uniqueid>",
+  "agent_extension": "<exten>",
+  "agent_username": "<string>",
+  "agent_id": "<string>"
+}
+```
+ 
 
 You can test the protocol using:
 
 `node server/mti-debug-server.js`
+
+
+## Deepgram Web Widget (new UI)
+
+The widget (public/widget.html) now includes:
+
+### Layout
+
+- Header bar with reload button (SVG)
+
+- Gray background container
+
+- Responsive full-width layout with padded margins
+
+### Message Alignment
+
+- Agent messages: right aligned
+
+- Client messages: left aligned with a light background
+
+- BOT suggestions: centered with white background
+
+### Additional Features
+
+- Autoscroll to the bottom on every update
+
+- Two toggles at the top:
+
+    - Show/Hide Transcription
+
+    - Show/Hide Generative Assistant
+
+- Logic based on:
+
+    - type=agent
+
+    - type=caller
+
+    - type=bot
+
+- call-start now supports:
+
+    - from
+
+    - to
+for correct display of caller/callee depending on incoming or outgoing calls.
+
 
 # 📊 Observability (Prometheus + Grafana)
 
@@ -206,6 +264,17 @@ DUMP_WAV=0
 MTI_HOST=127.0.0.1
 MTI_PORT=9092
 MTI_GW_HTTP_PORT=9093
+
+## GENERATIVE ASSISTANT
+GENERATIVE_ASSISTANT=true
+SHOW_TRANSCRIPTION=true
+GEN_ASS_ENGINE=n8n
+GEN_ASS_URL=https://pericles.irontec.com/webhook/2c750cb7-ccfe-48ec-b467-2a358358206f
+GEN_ASS_AUTH=
+GEN_ASS_NAME=BOT
+GEN_ASS_INTERVAL=10
+GEN_ASS_TAIL_CHARS=2000
+GEN_ASS_MIN_CHARS=120
 
 
 # 📞 Asterisk Integration
