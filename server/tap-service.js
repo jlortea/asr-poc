@@ -95,6 +95,8 @@ const {
   ARI_URL,
   ARI_USER,
   ARI_PASS,
+  ASTERISK_HTTP_PREFIX,
+
   TAP_APP_NAME,
   TAP_HTTP_PORT,
 
@@ -117,6 +119,34 @@ if (!ARI_URL || !ARI_USER || !ARI_PASS || !TAP_APP_NAME || !TAP_HTTP_PORT) {
   console.error('[TAP] ❌ Missing env (ARI_URL, ARI_USER, ARI_PASS, TAP_APP_NAME, TAP_HTTP_PORT)');
   process.exit(1);
 }
+
+
+// === Bloque de ARI_BASE_URL
+function stripSlashes(s) {
+  return String(s || '').trim().replace(/^\/+|\/+$/g, '');
+}
+
+function stripTrailingSlash(s) {
+  return String(s || '').trim().replace(/\/+$/g, '');
+}
+
+// Construye la base URL de ARI respetando prefix opcional y siendo retrocompatible
+function buildAriBaseUrl(rawBase, rawPrefix) {
+  const base = stripTrailingSlash(rawBase);
+  const prefix = stripSlashes(rawPrefix);
+
+  // Si no hay prefix, devolvemos base tal cual
+  if (!prefix) return base;
+
+  // Si el usuario ya incluyó el prefix en ARI_URL, no lo duplicamos
+  // Ej: base termina en "/asterisk"
+  if (base.endsWith('/' + prefix)) return base;
+
+  return `${base}/${prefix}`;
+}
+
+const ARI_BASE_URL = buildAriBaseUrl(ARI_URL, ASTERISK_HTTP_PREFIX);
+
 
 // === GW config ===
 const GATEWAYS = {
@@ -628,8 +658,8 @@ async function handleSnoopDeepgram({ ari, ch, uuid, exten, caller, callername, d
 // Main
 // =======================
 (async () => {
-  const ari = await client.connect(ARI_URL, ARI_USER, ARI_PASS);
-  console.log('[TAP] Connected to ARI', ARI_URL, 'user', ARI_USER);
+  const ari = await client.connect(ARI_BASE_URL, ARI_USER, ARI_PASS);
+  console.log('[TAP] Connected to ARI', ARI_BASE_URL, 'user', ARI_USER);
 
   ari.on('StasisStart', async (evt, ch) => {
     if (evt.application !== TAP_APP_NAME) return;
