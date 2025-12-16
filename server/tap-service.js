@@ -12,7 +12,7 @@
 
 const http   = require('http');
 const url    = require('url');
-const client = require('ari-client');
+const { connectAri } = require('./ari/ari-client');
 const prom   = require('prom-client');
 
 // =======================================================
@@ -658,7 +658,7 @@ async function handleSnoopDeepgram({ ari, ch, uuid, exten, caller, callername, d
 // Main
 // =======================
 (async () => {
-  const ari = await client.connect(ARI_BASE_URL, ARI_USER, ARI_PASS);
+  const ari = await connectAri(ARI_BASE_URL, ARI_USER, ARI_PASS);
   console.log('[TAP] Connected to ARI', ARI_BASE_URL, 'user', ARI_USER);
 
   ari.on('StasisStart', async (evt, ch) => {
