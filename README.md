@@ -36,7 +36,9 @@ The system is:
 │   ├── deepgram-gw.js           # RTP→Deepgram WebSocket gateway + widget + metrics
 │   ├── mti-debug-server.js      # Local fake MTI server for debugging the MTI flow
 │   ├── mti-gw.js                # RTP→MTI TCP gateway + metrics
-│   └── tap-service.js           # Asterisk ARI tap logic + ExternalMedia + routing + metrics
+│   ├── tap-service.js           # Asterisk ARI tap logic + ExternalMedia + routing + metrics
+|   └── ari
+|       └── ari-client.js        # A custom native ARI adapter
 └── tap-package.json             # Dependencies template for tap-service
 ```
 
@@ -156,6 +158,60 @@ The widget (public/widget.html) now includes:
 
     - to
 for correct display of caller/callee depending on incoming or outgoing calls.
+
+# 🔌 ARI Client Implementation
+
+This project **no longer uses `node-ari-client`**.
+
+A custom **native ARI adapter** is now implemented in:
+`server/ari/ari-client.js`
+
+
+### Why this change?
+
+Some Asterisk deployments (e.g. iVoz / proxied setups) expose ARI under an
+**HTTP prefix**, for example:
+`http://<host>:8088/asterisk`
+
+
+The swagger-based `node-ari-client` **breaks in these scenarios** because it
+cannot correctly resolve prefixed ARI paths.
+
+### What is used instead?
+
+The TAP service now uses a **minimal native ARI adapter** based on:
+
+- ARI REST (HTTP)
+- ARI Events WebSocket (WS)
+
+This adapter:
+
+- Preserves **any HTTP prefix** (`/asterisk`)
+- Does **not depend on swagger**
+- Keeps the **same API surface** used by `tap-service`
+  (`snoopChannel`, `externalMedia`, `Bridge`, `on(Stasis*)`, etc.)
+
+No changes are required in the Asterisk dialplan.
+
+### ARI WebSocket endpoint differences (DEV / PRO)
+
+Depending on the Asterisk configuration, the ARI **WebSocket endpoint may differ**:
+
+| Environment | Working WS endpoint |
+|------------|---------------------|
+| DEV        | `/ari/events`       |
+| PRO        | `/ws`               |
+
+Examples:
+
+DEV: `ws://<host>:8088/ari/events?app=deitu-mti-tap&api_key=user:pass`
+
+PRO (with HTTP prefix): `ws://<host>:8088/asterisk/ws?app=deitu-mti-tap&api_key=user:pass`
+
+
+The ARI adapter **auto-detects and builds the correct WS URL** based on
+`ARI_URL`, so **no environment-specific code changes are required**.
+
 
 
 # 📊 Observability (Prometheus + Grafana)
@@ -367,6 +423,13 @@ To add new Node dependencies:
     
 
 `docker compose up -d --build`
+
+# 🧾 Notes
+
+- v2.0.0+: Replaced `node-ari-client` with a native ARI REST + WebSocket adapter
+- v2.0.1+: Improved HTTP prefix compatibility
+- v2.0.2+: Stable ARI WS autodetection for DEV and PRO
+
 
 # 📄 License
 
