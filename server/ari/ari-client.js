@@ -24,13 +24,28 @@ function joinUrl(base, path) {
   return base + path;
 }
 
-function toWsUrl(httpBase) {
-  // http://host:port/prefix  -> ws://host:port/prefix
-  // https://...              -> wss://...
-  if (httpBase.startsWith('https://')) return 'wss://' + httpBase.slice('https://'.length);
-  if (httpBase.startsWith('http://'))  return 'ws://'  + httpBase.slice('http://'.length);
-  // fallback
-  return httpBase;
+function buildAriWsUrl(httpBase, { appName, user, pass }) {
+  // Build a WS URL that preserves any HTTP prefix in httpBase (e.g. /asterisk)
+  // Example:
+  //   http://host:8088/asterisk  -> ws://host:8088/asterisk/ari/events?...&subscribeAll=true
+  const u = new URL(httpBase);
+
+  // switch protocol
+  u.protocol = (u.protocol === 'https:') ? 'wss:' : 'ws:';
+
+  // normalize base path (keep prefix if any)
+  const basePath = u.pathname.replace(/\/+$/, ''); // "" or "/asterisk"
+  u.pathname = `${basePath}/ari/events`;
+
+  // query string
+  const qs = new URLSearchParams({
+    app: appName,
+    api_key: `${user}:${pass}`,
+    subscribeAll: 'true'
+  });
+  u.search = qs.toString();
+
+  return u.toString();
 }
 
 class AriChannel extends EventEmitter {
@@ -94,14 +109,12 @@ class AriAdapter extends EventEmitter {
   }
 
   async start(appName) {
-    // ARI events WS: /ari/events?app=...&api_key=user:pass&subscribeAll=true
-    const wsBase = toWsUrl(this.baseUrl);
-    const qs = new URLSearchParams({
-      app: appName,
-      api_key: `${this.user}:${this.pass}`,
-      subscribeAll: 'true'
+    // ARI events WS: <base-with-prefix>/ari/events?app=...&api_key=user:pass&subscribeAll=true
+    const wsUrl = buildAriWsUrl(this.baseUrl, {
+      appName,
+      user: this.user,
+      pass: this.pass
     });
-    const wsUrl = joinUrl(wsBase, `/ari/events?${qs.toString()}`);
 
     this._ws = new WebSocket(wsUrl);
     this._ws.on('open', () => this.emit('_ws_open'));

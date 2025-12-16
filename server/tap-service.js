@@ -661,6 +661,10 @@ async function handleSnoopDeepgram({ ari, ch, uuid, exten, caller, callername, d
   const ari = await connectAri(ARI_BASE_URL, ARI_USER, ARI_PASS);
   console.log('[TAP] Connected to ARI', ARI_BASE_URL, 'user', ARI_USER);
 
+  ari.on('error', (err) => {
+    console.error('[TAP] ARI adapter error:', err?.message || err);
+  });
+
   ari.on('StasisStart', async (evt, ch) => {
     if (evt.application !== TAP_APP_NAME) return;
 
