@@ -99,7 +99,8 @@ class AriAdapter extends EventEmitter {
     this.channels = {
       snoopChannel: (p) => this._snoopChannel(p),
       externalMedia: (p) => this._externalMedia(p),
-      get: (p) => this._getChannel(p)
+      get: (p) => this._getChannel(p),
+      list: () => this._listChannels()
     };
   }
 
@@ -159,6 +160,11 @@ class AriAdapter extends EventEmitter {
     const res = await this._requestJson('GET', `/ari/channels/${encodeURIComponent(channelId)}`);
     const ch = this._getOrCreateChannelFromEvent(res);
     return ch;
+  }
+
+  async _listChannels() {
+    const res = await this._requestJson('GET', `/ari/channels`);
+    return Array.isArray(res) ? res : [];
   }
 
   async _snoopChannel({ channelId, app, spy = 'both', appArgs = '' }) {

@@ -300,6 +300,36 @@ function deepgramHttp(pathname, qs) {
   });
 }
 
+async function resolveAriChannelIdByName(ari, channelName) {
+  const chans = await ari.channels.list();
+  let match = chans.find(c => c && c.name === channelName);
+
+  // fallback por si hay pequeñas variaciones
+  if (!match) match = chans.find(c => c && typeof c.name === 'string' && c.name.startsWith(channelName));
+
+  if (!match || !match.id) {
+    throw new Error(`ARI channel not found by name="${channelName}" (active=${chans.length})`);
+  }
+  return match.id;
+}
+
+async function snoopChannelCompat(ari, params) {
+  // params = { channelId, app, spy, appArgs }
+  try {
+    return await ari.channels.snoopChannel(params);
+  } catch (e) {
+    // Solo hacemos fallback si realmente es "not found"
+    const is404 = (e && (e.statusCode === 404 || String(e.message || '').includes('-> 404')));
+    const looksLikeName = params.channelId && String(params.channelId).includes('/');
+
+    if (!is404 || !looksLikeName) throw e;
+
+    const resolvedId = await resolveAriChannelIdByName(ari, params.channelId);
+    console.log(`[TAP] ARI snoop fallback: name="${params.channelId}" -> id="${resolvedId}"`);
+    return await ari.channels.snoopChannel({ ...params, channelId: resolvedId });
+  }
+}
+
 // retry sobre addChannel para evitar "Channel not found" race
 async function addToBridgeWithRetry(bridge, channelId, tries = 12, delayMs = 80) {
   for (let i = 0; i < tries; i++) {
@@ -784,45 +814,48 @@ async function handleSnoopDeepgram({ ari, ch, uuid, exten, caller, callername, d
       });
     }
 
-    try {
-      if (gw === 'mti') {
-        await ari.channels.snoopChannel({
-          channelId: chan,
-          app: TAP_APP_NAME,
-          spy: 'both',
-          appArgs: `${uuid},snoop,mti`
-        });
-      } else if (gw === 'deepgram') {
-        const baseArgs = `${uuid},snoop,deepgram,${exten},${caller},${callername}`;
+  try {
+    if (gw === 'mti') {
+      await snoopChannelCompat(ari, {
+        channelId: chan,
+        app: TAP_APP_NAME,
+        spy: 'both',
+        appArgs: `${uuid},snoop,mti`
+      });
+    } else if (gw === 'deepgram') {
+      const baseArgs = `${uuid},snoop,deepgram,${exten},${caller},${callername}`;
 
-        await ari.channels.snoopChannel({
-          channelId: chan,
-          app: TAP_APP_NAME,
-          spy: 'in',
-          appArgs: `${baseArgs},in`
-        });
+      await snoopChannelCompat(ari, {
+        channelId: chan,
+        app: TAP_APP_NAME,
+        spy: 'in',
+        appArgs: `${baseArgs},in`
+      });
 
-        await ari.channels.snoopChannel({
-          channelId: chan,
-          app: TAP_APP_NAME,
-          spy: 'out',
-          appArgs: `${baseArgs},out`
-        });
-      } else {
-        await ari.channels.snoopChannel({
-          channelId: chan,
-          app: TAP_APP_NAME,
-          spy: 'both',
-          appArgs: `${uuid},snoop,mti`
-        });
-      }
-
-      res.statusCode = 200; res.end('OK');
-    } catch (err) {
-      console.error('[TAP] ❌ Error creating SnoopChannel:', err?.message || err);
-      cTapErrors.inc({ place: 'start_tap', gw });
-      res.statusCode = 500; res.end('ERROR');
+      await snoopChannelCompat(ari, {
+        channelId: chan,
+        app: TAP_APP_NAME,
+        spy: 'out',
+        appArgs: `${baseArgs},out`
+      });
+    } else {
+      await snoopChannelCompat(ari, {
+        channelId: chan,
+        app: TAP_APP_NAME,
+        spy: 'both',
+        appArgs: `${uuid},snoop,mti`
+      });
     }
+
+    res.statusCode = 200;
+    res.end('OK');
+  } catch (err) {
+    console.error('[TAP] ❌ Error creating SnoopChannel:', err?.message || err);
+    cTapErrors.inc({ place: 'start_tap', gw });
+    res.statusCode = 500;
+    res.end('ERROR');
+  }
+
   });
 
   server.listen(port, '0.0.0.0', () => {
