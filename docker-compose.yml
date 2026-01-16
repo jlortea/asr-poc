@@ -2,32 +2,32 @@ services:
   ##########################################
   # GATEWAY DEEPGRAM (deepgram-gw)
   ##########################################
-  deepgram-gw:
-    env_file:
-      - ./.env
-    image: node:20-alpine
-    working_dir: /app
-    command: ["sh","-c","cp /app/gw-package.json /app/package.json && npm install --omit=dev && node server/deepgram-gw.js"]
-    environment:
-      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
-      - WIDGET_PORT=${WIDGET_PORT}
- #    - RTP_PORT=${RTP_PORT}
-      - DG_LANGUAGE=${DG_LANGUAGE}
-      - DG_INTERIM=${DG_INTERIM}
-      - DG_PUNCTUATE=${DG_PUNCTUATE}
-      - DG_SMART_FORMAT=${DG_SMART_FORMAT}
-      - DG_DIARIZE=${DG_DIARIZE}
-      - SWAP_ENDIAN=${SWAP_ENDIAN}
-      - DUMP_WAV=${DUMP_WAV}
-    volumes:
-      - ./server:/app/server
-      - ./public:/app/public
-      - ./gw-package.json:/app/gw-package.json:ro
-    ports:
-      - "18080:8080"        # widget (HTTP) + /metrics
-      - "40000:40000/udp"   # RTP IN
-      - "40001:40001/udp"   # RTP OUT
-    restart: unless-stopped
+  #deepgram-gw:
+  #  env_file:
+  #    - ./.env
+  #  image: node:20-alpine
+  #  working_dir: /app
+  #  command: ["sh","-c","cp /app/gw-package.json /app/package.json && npm install --omit=dev && node server/deepgram-gw.js"]
+  #  environment:
+  #    - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
+  #    - WIDGET_PORT=${WIDGET_PORT}
+  ##    - RTP_PORT=${RTP_PORT}
+  #    - DG_LANGUAGE=${DG_LANGUAGE}
+  #    - DG_INTERIM=${DG_INTERIM}
+  #    - DG_PUNCTUATE=${DG_PUNCTUATE}
+  #    - DG_SMART_FORMAT=${DG_SMART_FORMAT}
+  #    - DG_DIARIZE=${DG_DIARIZE}
+  #    - SWAP_ENDIAN=${SWAP_ENDIAN}
+  #    - DUMP_WAV=${DUMP_WAV}
+  #  volumes:
+  #    - ./server:/app/server
+  #    - ./public:/app/public
+  #    - ./gw-package.json:/app/gw-package.json:ro
+  #  ports:
+  #    - "18080:8080"        # widget (HTTP) + /metrics
+  #    - "40000:40000/udp"   # RTP IN
+  #    - "40001:40001/udp"   # RTP OUT
+  #  restart: unless-stopped
 
   ##########################################
   # GATEWAY MTI (mti-gw)  — RTP dinámico por llamada
