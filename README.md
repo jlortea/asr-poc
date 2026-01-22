@@ -220,6 +220,7 @@ MTI_GW_HTTP_PORT=9093
 ---
 
 # Complete Secuence Diagram
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -307,7 +308,7 @@ sequenceDiagram
     rect rgb(245,245,245)
     note over T,G: Observability (Prometheus)<br>Scrape /metrics on tap-service and mti-gw<br>Key metrics: sessions_active, sessions_created_total, sessions_ended_total{reason}, rtp_packets_total, tcp_errors_total
     end
-    ```
+```
 
 ---
 
