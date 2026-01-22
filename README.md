@@ -1,9 +1,8 @@
-# Deitu – Realtime Transcription Tap  
-### Asterisk → Deepgram / MTI → Prometheus + Grafana
+# MTI Mediagateway
+### Asterisk → MTI Gateway → MTI Server (Prometheus + Grafana)
 
 This project provides a fully containerized system that allows **tapping live calls from Asterisk**, routing audio to:
 
-- **Deepgram** (real-time speech-to-text)
 - **MTI** (custom TCP-based STT service)
 
 …while exposing **full observability via Prometheus + Grafana**.
@@ -33,7 +32,6 @@ The system is:
 ├── public
 │   └── widget.html              # Browser-side transcription widget
 ├── server
-│   ├── deepgram-gw.js           # RTP→Deepgram WebSocket gateway + widget + metrics
 │   ├── mti-debug-server.js      # Local fake MTI server for debugging the MTI flow
 │   ├── mti-gw.js                # RTP→MTI TCP gateway + metrics
 │   ├── tap-service.js           # Asterisk ARI tap logic + ExternalMedia + routing + metrics
@@ -42,44 +40,9 @@ The system is:
 └── tap-package.json             # Dependencies template for tap-service
 ```
 
+---
+
 # 🧩 High-Level Architecture
-
-## 🔷 Deepgram Path (default)
-
-`Asterisk → TAP service → Deepgram-GW → Deepgram Cloud → Browser widget`
-
-Steps:
-
-1.  **Asterisk** receives a call → the dialplan calls:
-    
-    `http://<host>:3200/start_tap?chan=...&uuid=...&gw=deepgram&caller=...&exten=...`
-    
-2.  **tap-service**:
-    
-    -   Creates **two ARI snoops** (IN = caller, OUT = agent)
-        
-    -   Creates **ExternalMedia** channels pointed at deepgram-gw RTP ports
-        
-    -   Sends `/register` to deepgram-gw
-        
-3.  **deepgram-gw**:
-    
-    -   Receives IN/OUT RTP
-        
-    -   Streams to Deepgram WebSocket API
-        
-    -   Emits transcripts to the browser widget (Socket.IO)
-        
-    -   Serves `public/widget.html`
-        
-4.  **Widget** displays:
-    
-    -   Timestamp
-        
-    -   Speaker diarization (caller/agent)
-        
-    -   Partial & final messages
-        
 
 ## 🔶 MTI Path
 
@@ -113,51 +76,7 @@ You can test the protocol using:
 
 `node server/mti-debug-server.js`
 
-
-## Deepgram Web Widget (new UI)
-
-The widget (public/widget.html) now includes:
-
-### Layout
-
-- Header bar with reload button (SVG)
-
-- Gray background container
-
-- Responsive full-width layout with padded margins
-
-### Message Alignment
-
-- Agent messages: right aligned
-
-- Client messages: left aligned with a light background
-
-- BOT suggestions: centered with white background
-
-### Additional Features
-
-- Autoscroll to the bottom on every update
-
-- Two toggles at the top:
-
-    - Show/Hide Transcription
-
-    - Show/Hide Generative Assistant
-
-- Logic based on:
-
-    - type=agent
-
-    - type=caller
-
-    - type=bot
-
-- call-start now supports:
-
-    - from
-
-    - to
-for correct display of caller/callee depending on incoming or outgoing calls.
+---
 
 # 🔌 ARI Client Implementation
 
@@ -212,7 +131,7 @@ PRO (with HTTP prefix): `ws://<host>:8088/asterisk/ws?app=deitu-mti-tap&api_key=
 The ARI adapter **auto-detects and builds the correct WS URL** based on
 `ARI_URL`, so **no environment-specific code changes are required**.
 
-
+---
 
 # 📊 Observability (Prometheus + Grafana)
 
@@ -247,17 +166,6 @@ Import dashboards from `docs/grafana/`:
     
 
 ### Important Metrics
-
-**Deepgram-GW**
-
--   `dg_sessions_active`
-    
--   `rate(dg_rtp_packets_total[30s])`
-    
--   `dg_ws_reconnects_total`
-    
--   `dg_zero_frames_total{dir="in"|"out"}`
-    
 
 **TAP**
 
@@ -297,18 +205,6 @@ RTP_HOST_MTI=192.168.1.65
 MTI_RTP_START=41000
 MTI_RTP_END=41999
 
-## TAP → Deepgram RTP fixed ports
-RTP_HOST_DEEPGRAM_IN=192.168.1.65:40000
-RTP_HOST_DEEPGRAM_OUT=192.168.1.65:40001
-
-## Deepgram API
-DEEPGRAM_API_KEY=your_key
-DG_LANGUAGE=es
-DG_INTERIM=true
-DG_PUNCTUATE=true
-DG_SMART_FORMAT=true
-DG_DIARIZE=true
-
 ## Widget hosted by deepgram-gw
 WIDGET_PORT=8080
 
@@ -321,17 +217,99 @@ MTI_HOST=127.0.0.1
 MTI_PORT=9092
 MTI_GW_HTTP_PORT=9093
 
-## GENERATIVE ASSISTANT
-GENERATIVE_ASSISTANT=true
-SHOW_TRANSCRIPTION=true
-GEN_ASS_ENGINE=n8n
-GEN_ASS_URL=https://pericles.irontec.com/webhook/2c750cb7-ccfe-48ec-b467-2a358358206f
-GEN_ASS_AUTH=
-GEN_ASS_NAME=BOT
-GEN_ASS_INTERVAL=10
-GEN_ASS_TAIL_CHARS=2000
-GEN_ASS_MIN_CHARS=120
+---
 
+# Complete Secuence Diagram
+```mermaid
+sequenceDiagram
+    autonumber
+
+    participant U as User or PSTN
+    participant A as Asterisk PBX
+    participant T as tap-service
+    participant G as mti-gw
+    participant M as MTI Server
+
+    rect rgb(245,245,245)
+    note over A: Dialplan trigger<br>Invokes tap-service when the call starts or enters a given context<br>Example: CURL to /start_tap with chan and uuid
+    U->>A: Incoming or outgoing SIP call
+    A->>A: Generate CHANNEL(uniqueid)<br>UUID = Asterisk UNIQUEID
+    A->>T: HTTP GET /start_tap?chan=...&uuid=...&gw=mti&agent_extension=...&agent_username=...&agent_id=...<br>tap-service HTTP port: 3200
+    T-->>A: HTTP 200 OK (or non-200 on failure)
+    end
+
+    rect rgb(245,245,245)
+    note over T,A: ARI control plane<br>tap-service duplicates audio best-effort without affecting call continuity
+    T->>A: ARI connect (REST/WebSocket depending on client)<br>Asterisk ARI port: 8088
+    T->>A: ARI create SnoopChannel (spy=both) for chan
+    T->>A: ARI create Mixing Bridge
+    T->>A: ARI add SnoopChannel to Bridge
+    T->>T: Allocate dynamic RTP UDP port for this call<br>Example range: 41000-41999 (1 UDP port = 1 call)
+    T->>G: HTTP GET /register?uuid=...&port=...&agent_extension=...&agent_username=...&agent_id=...<br>mti-gw HTTP port: 9093
+    G-->>T: HTTP 200 OK (registered) or 4xx/5xx (rejected)
+    end
+
+    rect rgb(245,245,245)
+    note over T,A: Media injection into gateway<br>ExternalMedia sends RTP (SLIN16) to the allocated UDP port on mti-gw
+    T->>A: ARI create ExternalMedia(format=slin16, external_host=RTP_HOST_MTI:port)
+    A-->>G: RTP over UDP to port (dynamic per call)<br>Payload: SLIN16 PCM 16kHz 16-bit LE mono
+    end
+
+    rect rgb(245,245,245)
+    note over G: mti-gw internal state machine (per call)<br>IDLE -> REGISTERED -> TCP_CONNECTING -> TCP_CONNECTED -> STREAMING -> ENDED<br>Any state -> FAILED (on TCP/UDP errors)<br>STREAMING -> ENDED (on unregister or inactivity timeout)
+    end
+
+    rect rgb(245,245,245)
+    note over G,M: MTI session over TCP (1 socket per call)<br>Framing: [TYPE 1B][LEN 2B big-endian][PAYLOAD nB]<br>Types: 0x01 START, 0x12 AUDIO(640B), 0x00 END
+    G->>M: TCP connect (1 per call)<br>Destination: MTI_HOST:MTI_PORT
+    G->>M: START frame (0x01)<br>LEN = bytes(payload)<br>PAYLOAD UTF-8 JSON e.g.<br>{"call_uuid":"...","agent_extension":"...","agent_username":"...","agent_id":"..."}
+    loop While RTP packets arrive
+        G->>G: Strip RTP header, extract payload, append to buffer
+        G->>G: Chunk buffer into exact 640-byte audio frames (20ms)<br>320 samples -> 640 bytes
+        G->>M: AUDIO frame (0x12)<br>LEN = 0x0280<br>PAYLOAD = 640 bytes PCM
+    end
+    end
+
+    rect rgb(245,245,245)
+    note over T,G: Control endpoints used (summary)<br>tap-service: GET /start_tap (from Asterisk dialplan)<br>mti-gw: GET /register, GET /unregister<br>Both expose GET /metrics (Prometheus)
+    end
+
+    rect rgb(245,245,245)
+    note over A,T: Cleanup is best-effort<br>Even if MTI fails, Asterisk call must continue normally
+    alt Normal call hangup
+        U->>A: Hang up
+        T->>A: ARI detects original channel hangup
+        T->>G: HTTP GET /unregister?uuid=... (or by port)<br>mti-gw HTTP port: 9093
+        G->>M: END frame (0x00)<br>LEN = 0
+        G->>M: TCP close (client closes socket)
+        G-->>T: HTTP 200 OK
+        T->>A: ARI cleanup: destroy ExternalMedia, Bridge, SnoopChannel
+    else RTP inactivity timeout in mti-gw
+        note over G: Inactivity = no RTP packets received (not silence detection)<br>Gateway timeout example: 8s<br>MTI server inactivity timeout may be longer (e.g., 300s)
+        G->>M: END frame (0x00) if possible
+        G->>M: TCP close
+        G->>G: Transition to ENDED/FAILED and release UDP port
+        T->>A: Call continues (tap is best-effort)
+    else MTI closes socket or TCP error
+        note over G: If MTI closes the socket: session is failed<br>No retry, no reconnect with same UUID
+        G->>G: Transition to FAILED, stop streaming
+        G->>M: TCP close (if not already)
+        G->>G: Cleanup session and release UDP port
+        T->>A: Call continues (no PBX impact)
+    else Register rejected (e.g., concurrency limit)
+        note over G: If /register is rejected (e.g., >5 concurrent sessions)<br>No MTI analysis for that call
+        G-->>T: HTTP 429/503 (example)
+        T->>A: Optionally skip ExternalMedia and cleanup ARI objects for tap
+        A->>A: Call continues normally
+    end
+    end
+
+    rect rgb(245,245,245)
+    note over T,G: Observability (Prometheus)<br>Scrape /metrics on tap-service and mti-gw<br>Key metrics: sessions_active, sessions_created_total, sessions_ended_total{reason}, rtp_packets_total, tcp_errors_total
+    end
+    ```
+
+---
 
 # 📞 Asterisk Integration
 
@@ -352,6 +330,8 @@ Contains a **real working example**:
 
 This file is **a template**, not a mandatory dialplan.
 
+---
+
 # ▶️ Running the Full Stack
 
 From repo root:
@@ -367,28 +347,11 @@ Check logs:
 | Service     | URL                     |
 |-------------|--------------------------|
 | TAP         | http://\<host\>:3200     |
-| Deepgram-GW | http://\<host\>:18080    |
 | MTI-GW      | http://\<host\>:9093     |
 | Prometheus  | http://\<host\>:9090     |
 | Grafana     | http://\<host\>:3000     |
 
-
-# 🖥️ Live Widget
-
-Open in browser:
-
-`http://<docker-host>:18080/widget.html?uuid=<room>`
-
-Where `<room>` is usually:
-
--   the **extension** of the agent, or
-    
--   any room name you configured in the dialplan
-    
-
-Example:
-
-`http://192.168.1.65:18080/widget.html?uuid=agente`
+---
 
 # 🧪 MTI Debug Server
 
@@ -421,7 +384,6 @@ To add new Node dependencies:
         
 2.  Rebuild:
     
-
 `docker compose up -d --build`
 
 # 🧾 Notes
