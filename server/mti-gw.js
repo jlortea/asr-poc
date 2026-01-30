@@ -19,6 +19,11 @@ const prom  = require('prom-client');
 const MTI_HOST = process.env.MTI_HOST || '127.0.0.1';
 const MTI_PORT = Number(process.env.MTI_PORT || 9092);
 
+// If enabled, swap byte order for 16-bit PCM samples (s16le <-> s16be).
+// Symptom when needed: audio sounds like loud noise / "digital hash".
+// Set SWAP_ENDIAN=1 to fix.
+const SWAP_ENDIAN = String(process.env.SWAP_ENDIAN || '0') === '1';
+
 // HTTP control
 const MTI_GW_HTTP_PORT = Number(process.env.MTI_GW_HTTP_PORT || 9093);
 
@@ -119,6 +124,17 @@ function buildFrame(type, payloadBuf) {
   buf[0] = type;
   buf.writeUInt16BE(len, 1);
   if (payloadBuf && len > 0) payloadBuf.copy(buf, 3);
+  return buf;
+}
+
+function swap16InPlace(buf) {
+  // Swap each 16-bit sample: [lo,hi] -> [hi,lo]
+  // Assumes buf length is even; if odd, last byte is left as-is.
+  for (let i = 0; i + 1 < buf.length; i += 2) {
+    const a = buf[i];
+    buf[i] = buf[i + 1];
+    buf[i + 1] = a;
+  }
   return buf;
 }
 
@@ -231,8 +247,15 @@ function createSession(port, uuid, meta) {
     sess.audioBuffer = Buffer.concat([sess.audioBuffer, payload]);
 
     while (sess.audioBuffer.length >= AUDIO_FRAME_SIZE) {
-      const chunk = sess.audioBuffer.subarray(0, AUDIO_FRAME_SIZE);
+      let chunk = sess.audioBuffer.subarray(0, AUDIO_FRAME_SIZE);
       sess.audioBuffer = sess.audioBuffer.subarray(AUDIO_FRAME_SIZE);
+
+      // Optional endianness swap for 16-bit PCM ("loud noise" workaround)
+      if (SWAP_ENDIAN) {
+        const copy = Buffer.from(chunk);
+        swap16InPlace(copy);
+        chunk = copy;
+      }
 
       const frame = buildFrame(0x12, chunk);
       if (sess.ended) return;
