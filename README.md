@@ -212,6 +212,156 @@ WIDGET_PORT=8080
 SWAP_ENDIAN=1
 DUMP_WAV=0
 
+### Audio integrity validation (important)
+
+During end‑to‑end (E2E) tests with a real MTI client we observed that audio was:
+
+- Received continuously (no RTP loss)
+- Correct frame rate (~50 fps)
+- Correct byte volume
+- But **audibly corrupted** (noise / vibratory signal, voice barely intelligible)
+
+After deep inspection of RTP payloads, TCP captures and WAV reconstruction, the root cause was identified as **PCM endianness mismatch**.
+
+The audio stream is:
+- PCM SLIN16
+- 16 kHz
+- Mono
+
+However, sample byte order required swapping before forwarding to MTI.
+
+To solve this, `mti-gw` now supports **explicit byte‑swap** using:
+
+```env
+SWAP_ENDIAN=1
+```
+
+When enabled, each 16‑bit PCM sample is swapped before being sent downstream.
+
+Once enabled, E2E audio became **fully intelligible and clean**.
+
+### How to validate audio with mti-debug-server
+
+The `mti-debug-server.js` utility is a standalone Node.js application that simulates the MTI TCP endpoint and allows **raw audio inspection**.
+
+#### 1. Run the debug server
+
+```bash
+node mti-debug-server.js
+```
+
+It will listen on:
+
+```
+0.0.0.0:9092
+```
+
+#### 2. Point mti-gw to the debug server
+
+Configure mti-gw to connect to the debug server IP and port (9092).
+
+#### 3. Capture raw audio
+
+For each call, the debug server will dump a `.raw` file containing PCM audio:
+
+```
+mti-__call_uuid__...__.raw
+```
+
+#### 4. Convert RAW → WAV
+
+Use ffmpeg to convert and listen:
+
+```bash
+ffmpeg -f s16le -ar 16000 -ac 1 input.raw output.wav
+```
+
+You can then play the WAV file with any audio player.
+
+If audio sounds noisy or distorted, check:
+
+- `SWAP_ENDIAN` value
+- Sample rate (must be 16000 Hz)
+- That no additional transcoding is applied
+
+This validation method was used to confirm full E2E correctness before MTI pilot tests.
+
+### Audio integrity validation (important)
+
+During E2E tests with a real MTI client we observed that audio was:
+- Present at correct rate (50 fps, 640 bytes / frame)
+- Correct duration and volume
+- But **audibly corrupted** (noise / vibration / low intelligibility)
+
+After inspecting RTP payloads, TCP frames and reconstructed WAV files, the root cause was identified as **PCM endianness mismatch**.
+
+#### Root cause
+
+- Asterisk sends audio as **SLIN16 little‑endian**
+- MTI protocol expects **little‑endian PCM**
+- Initial gateway implementation forwarded samples without swapping
+- On some paths the byte order was effectively reversed, producing noise
+
+#### Fix
+
+`mti-gw` now supports explicit endian swapping using:
+
+```
+SWAP_ENDIAN=1
+```
+
+When enabled, every 16‑bit sample is byte‑swapped **before** being sent over TCP.
+
+This aligns MTI with Deepgram behaviour and restores perfect audio quality.
+
+---
+
+### How to validate audio using `mti-debug-server`
+
+`mti-debug-server.js` is a **standalone Node.js tool** (not part of the stack) used to:
+- Accept MTI TCP connections
+- Collect metrics (FPS, gaps, duration)
+- Dump **raw PCM audio** exactly as received
+
+#### 1. Run the debug server
+
+```
+node mti-debug-server.js
+```
+
+It listens on `0.0.0.0:9092` by default.
+
+#### 2. Point `mti-gw` to the debug server
+
+```
+MTI_HOST=<debug-server-ip>
+MTI_PORT=9092
+```
+
+#### 3. Make a test call
+
+On call end, the server will generate a file like:
+
+```
+mti-__call_uuid__...__.raw
+```
+
+This file is **pure PCM s16le 16 kHz mono**.
+
+#### 4. Convert RAW → WAV
+
+```
+ffmpeg -f s16le -ar 16000 -ac 1 -i "archivo.raw" "archivo.wav"
+```
+
+If audio is correct:
+- Voice is clear
+- No vibration or noise
+- Normal telephony spectrum (300–3400 Hz)
+
+This method validates the full chain:
+**Asterisk → tap-service → mti-gw → MTI TCP**
+
 ## MTI
 MTI_HOST=127.0.0.1
 MTI_PORT=9092
@@ -373,6 +523,81 @@ Shows:
 
 Helpful to test mti-gw end-to-end.
 
+## 🔊 Audio validation and endianness
+
+During recent end‑to‑end (E2E) tests we detected that audio was **being received correctly** but sounded distorted, noisy or vibratory when reconstructed from RTP/TCP captures.
+After deep analysis of RTP payloads, WAV reconstruction and spectrograms, the root cause was identified as a **PCM endianness mismatch**.
+
+### Audio format
+
+- Codec: **SLIN16 / PCM signed 16‑bit**
+- Sample rate: **16 kHz** (not 8 kHz)
+- Channels: **Mono**
+
+### Endianness issue
+
+Although the audio content was correct, the byte order of PCM samples required swapping.
+Once endianness was corrected, audio became perfectly intelligible.
+
+This behavior is similar to what was previously observed in the Deepgram ASR PoC, where the following environment variable was required:
+
+```
+SWAP_ENDIAN=1
+```
+
+The same logic has now been applied to **mti-gw**, so audio is sent in the expected format.
+
+## 🛠️ How to validate audio with mti-debug-server
+
+`mti-debug-server.js` is a **stand‑alone Node.js application** used only for debugging and validation. It is not part of the MTI services stack.
+
+It can:
+
+- Receive MTI TCP audio streams
+- Collect metrics
+- Dump raw PCM audio to `.raw` files for offline inspection
+
+### 1. Capture traffic
+
+Example TCP capture:
+
+```
+sudo tcpdump -i any -nn -s 0 -w mti-tcp.pcap 'tcp and host <debug-server-ip> and port <port>'
+```
+
+### 2. Extract raw audio from capture
+
+```
+tshark -r mti-tcp.pcap -Y "tcp.len > 0" -T fields -e tcp.payload \
+| tr -d '\n' | xxd -r -p > mti_audio.raw
+```
+
+### 3. Convert RAW → WAV
+
+```
+ffmpeg -f s16le -ar 16000 -ac 1 -i mti_audio.raw mti_audio.wav
+```
+
+If needed (endianness correction):
+
+```
+ffmpeg -f s16le -ar 16000 -ac 1 -i mti_audio.raw -af aformat=sample_fmts=s16:channel_layouts=mono mti_audio.wav
+```
+
+### 4. Listen and analyze
+
+```
+ffplay mti_audio.wav
+```
+
+Optional diagnostics:
+
+```
+ffmpeg -i mti_audio.wav -af volumedetect -f null -
+```
+
+This workflow was used to fully validate the MTI audio path end‑to‑end.
+
 # 🧱 Development Notes
 
 To add new Node dependencies:
@@ -398,3 +623,72 @@ To add new Node dependencies:
 
 No license is included.  
 Default: **All rights reserved**.
+
+### Audio integrity validation (important)
+
+During end‑to‑end (E2E) tests with a real MTI client we observed that audio was received correctly at protocol level but sounded corrupted when reconstructed.
+
+**Symptoms**
+- Continuous stream, no RTP loss
+- ~50 audio frames per second
+- Correct payload sizes
+- Audio perceived as noise / vibration, voice barely intelligible
+
+**Root cause**
+The issue was caused by **PCM endianness mismatch**.
+
+- Audio format: SLIN16 (PCM 16‑bit, 16 kHz, mono)
+- The PCM samples sent by Asterisk must be interpreted as **little‑endian**
+- Without byte‑swapping, the waveform amplitude is severely distorted
+
+This is the same behaviour previously observed in Deepgram‑based PoCs and is now explicitly handled in MTI.
+
+**Solution**
+Enable endian swap in the environment:
+
+```env
+SWAP_ENDIAN=1
+```
+
+Once enabled, the recovered audio becomes fully intelligible and clean.
+
+### Validating audio with mti‑debug‑server
+
+The `mti-debug-server.js` tool can be used to validate audio independently of any MTI client.
+
+It:
+- Accepts the MTI TCP stream
+- Dumps raw PCM audio per call
+- Logs frame rate, gaps and duration
+
+#### Convert RAW to WAV
+
+After a test call, convert the dumped `.raw` file:
+
+```bash
+ffmpeg -f s16le -ar 16000 -ac 1 -i call_audio.raw call_audio.wav
+```
+
+You should hear clear, intelligible speech.
+
+If the audio sounds distorted:
+- Verify `SWAP_ENDIAN=1`
+- Confirm sample rate is 16 kHz
+- Confirm mono channel
+
+This method is the **recommended way to validate E2E audio correctness**.
+
+## Audio validation with mti-debug-server
+
+mti-debug-server allows validating audio end-to-end.
+
+1. Run server: `node mti-debug-server.js`
+2. Make a test call
+3. Server dumps a `.raw` file (SLIN16, 16kHz, mono)
+4. Convert to WAV:
+```
+ffmpeg -f s16le -ar 16000 -ac 1 -i audio.raw audio.wav
+```
+
+If audio sounds distorted, ensure `SWAP_ENDIAN=1` is enabled in mti-gw.
+
